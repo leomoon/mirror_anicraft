@@ -12,7 +12,7 @@ use crate::app::App;
 use crate::dock::{Float, Layout, Panel};
 use crate::dock_ui::{Act, Drag, Drawn, MENU_W, Over, Where, apply, end_drag, menu_button, panel_body, region, tab_row};
 use crate::theme::T;
-use egui::{Id, Rect, Sense, WidgetType, pos2, vec2};
+use egui::{Id, Rect, Sense, Role, pos2, vec2};
 
 /// Draws every floating window.
 pub fn floating(app: &mut App, ctx: &egui::Context) {
@@ -42,7 +42,7 @@ fn strip(app: &mut App, ui: &mut egui::Ui, f: &Float, layout: &Layout, anchor: b
     ui.horizontal(|ui| {
         // The grip: dragged, the whole window; clicked, the shown panel's menu.
         let (g, resp) = ui.allocate_exact_size(vec2(14.0, 24.0), Sense::click_and_drag());
-        a11y::control(ui, &resp, WidgetType::Button, tr!("Window grip: drag to dock this window"), None);
+        a11y::control(ui, &resp, Role::Button, tr!("Window grip: drag to dock this window"), None);
         a11y::focus_ring(ui, &resp);
         let colour = if resp.hovered() || resp.dragged() { T.icon_hot } else { T.text_faint };
         for i in -1..=1 {
@@ -108,11 +108,11 @@ fn float_body(app: &mut App, ui: &mut egui::Ui, f: &Float, layout: &Layout, anch
 /// Floating inside the editor: an egui window.
 fn inside(app: &mut App, ctx: &egui::Context, f: &Float, layout: &Layout, acts: &mut Vec<Act>) {
     let Some(p) = f.shown() else { return };
-    let id = Id::new(("dock_float", f.id));
+    let id = Id::unique(("dock_float", f.id));
     let title = crate::i18n::t(p.label());
     let mut open = true;
     let size = vec2(f.size[0], f.size[1]);
-    let mut w = egui::Window::new(title).id(id).open(&mut open).collapsible(false).resizable(true).default_size(size).min_size([crate::dock::MIN_FLOAT, 120.0]);
+    let mut w = crate::windows::new(ctx, title).id(id).open(&mut open).collapsible(false).resizable(true).default_size(size).min_size([crate::dock::MIN_FLOAT, 120.0]);
     let at = f.at.map_or_else(|| ctx.content_rect().center() - size * 0.5, |a| pos2(a[0], a[1]));
     w = if app.dock_view.placed.insert(f.id) { w.current_pos(at) } else { w.default_pos(at) };
     let shown = w.show(ctx, |ui| {
@@ -152,6 +152,8 @@ fn own_window(app: &mut App, ctx: &egui::Context, f: &Float, layout: &Layout, ac
     }
     let builder = crate::platform::secondary_window(builder);
     let shortcuts = app.shortcuts.clone();
+    // The window's surface is set up and drawn inside the call (ADR 0105).
+    let paused = crate::gpu_stage::paused();
     let (close, commands) = ctx.show_viewport_immediate(egui::ViewportId::from_hash_of(("dock_float", f.id)), builder, |ui, class| {
         let (close, outer, inner) = ui.input(|i| (i.viewport().close_requested(), i.viewport().outer_rect, i.viewport().inner_rect));
         if let (Some(o), Some(i)) = (outer, inner) {
@@ -187,6 +189,7 @@ fn own_window(app: &mut App, ctx: &egui::Context, f: &Float, layout: &Layout, ac
         };
         (close, commands)
     });
+    drop(paused);
     for id in commands {
         app.invoke(id);
     }

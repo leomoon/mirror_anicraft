@@ -17,7 +17,9 @@ wipe, or text that reveals a picture.
 2. Make a new layer right above it and draw the mask shape there, with a fill.
 3. Right-click the mask layer and choose **Mask** (or choose **Modify › Timeline › Mask**).
 
-The layer below becomes **masked**: it's indented under the mask, which gets a stencil icon. To
+The layer below becomes **masked**: it's indented under the mask, which gets a stencil icon.
+The new mask layer is **locked**, as Animate leaves it, so you see the result and nothing else.
+Click its padlock when you want to move or reshape the mask. To
 mask more layers with the same mask, right-click each layer right under the group and choose
 **Masked**, or move it in under the mask with the up and down buttons. Moving a layer out of the
 group takes it out of the mask.
@@ -27,8 +29,10 @@ group takes it out of the mask.
 * Only the mask's **fills** count. Strokes, and the mask artwork's opacity, are ignored.
 * The mask always applies, on the stage and in every export, so what you see is what you get.
   If you're coming from Animate, there's no need to lock both layers to preview it.
-* While the mask layer is unlocked, its shapes' edges show in the layer colour, so you can select
-  and reshape them. Lock the mask layer to hide the edge.
+* While the mask layer is unlocked, its shapes' edges show on the stage in the layer colour, so
+  you can select and reshape them. Lock the mask layer to hide the edge: a mask you've just
+  made, or one that came in with an SVG, is locked already. The edge is only there while you
+  edit; it's never in Test Movie or an export.
 * Parts of the masked artwork that are hidden can't be picked on the stage.
 * Hiding the mask layer turns the mask off.
 * The mask layer's artwork can have keyframes and tweens like any other layer, for moving
@@ -227,8 +231,8 @@ Select a bone to see **Properties › Bone**:
 * **Springs: Enable** turns every spring of the armature on or off. Turn them off while you
   pose, to see exactly the poses you key; Test Movie and every export play them while they
   are on.
-* **Remove Bone** (or **Delete**): removes the bone and those below it. Their instances stay
-  where they are, on a layer of their own. If the armature has more than one pose, AniCraft asks
+* **Remove Bone** (or **Delete**): removes the bone and those below it. What they moved stays
+  where it is, on a layer of its own. If the armature has more than one pose, AniCraft asks
   first.
 
 Selecting a bone also selects the instance it moves. Properties then shows that instance's
@@ -299,8 +303,35 @@ to the rest pose first.
 
 Bones inside a shape take joint translation and springs too.
 
-Not there yet: symbols and shapes in one armature, reshaping at a posed frame, armatures
-that scripts pose while the movie plays, and armatures from Animate files.
+### Symbols and shapes in one armature
+
+One armature can hold both: a body drawn as a shape that bends, with a head, hands or props
+that are symbol instances, and more than one shape with bones. They pose, tween, spring and
+slide as one armature, on one armature layer.
+
+* **A symbol on a shape's bone.** With the **Bone** tool, drag from the end of a bone inside
+  the shape (the neck joint, say) and release over a symbol instance. The instance joins the
+  armature and follows that joint.
+* **A shape on a symbol's bone.** Drag from an instance and release over a shape. The bone
+  moves the shape as a whole. To make it bend as well, drag from that bone's end inside the
+  shape: this draws the shape's first bone, and its points are bound to it.
+* From the end of any bone you can go on either way, so a chain can run body, head, then a
+  feather on the head that bends.
+
+Drag any bone or part with the **Selection** tool, and the whole chain follows: pulling the
+head bends the body under it. The **Bind** tool shows the points of every shape with bones.
+Pick a bone, and you bind or paint the points of the shape that bone is inside.
+
+**Remove Bone** frees what the bone and the bones below it moved: instances and whole shapes
+go to a layer of their own, as they look at that moment. A shape that loses its last inside
+bone, but still hangs from a bone, stays in the armature and keeps the outline it showed.
+
+Files with such an armature need this version of AniCraft or a later one. An earlier version
+says the file is newer rather than opening it with parts missing. Documents without one are
+saved as before and open everywhere.
+
+Not there yet: joining two armatures into one, reshaping at a posed frame, armatures that
+scripts pose while the movie plays, and armatures from Animate files.
 
 ## Asset Warp
 

@@ -9,17 +9,25 @@
                                           AZURE_SIGNING_ENDPOINT (e.g. https://eus.codesigning.azure.net),
                                           AZURE_SIGNING_ACCOUNT, AZURE_CERT_PROFILE
   With neither, it prints a warning and leaves the files unsigned (exit code 0), so test builds
-  still produce installers.
+  still produce installers. A Nightly caller requires signing with -Required, can check that the
+  configuration is there with -Required -CheckOnly, and keeps signing material away from
+  compilation with -CheckBuildEnvironment.
 
   This is the one place to adapt when the signing setup changes (an HSM/cloud key, a different
   timestamp server, ...). Optional overrides: WINDOWS_TIMESTAMP_URL, SIGNTOOL (path to signtool.exe).
 
 .EXAMPLE
-  pwsh packaging/windows/sign.ps1 dist/anicraft.exe dist/Photocraft.msi
+  pwsh packaging/windows/sign.ps1 dist/anicraft.exe dist/AniCraft.msi
+  pwsh packaging/windows/sign.ps1 -Required dist/anicraft.exe
+  pwsh packaging/windows/sign.ps1 -Required -CheckOnly
+  pwsh packaging/windows/sign.ps1 -CheckBuildEnvironment
 #>
 param(
-  [Parameter(Mandatory = $true, ValueFromRemainingArguments = $true)]
-  [string[]] $Files
+  [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
+  [string[]] $Files,
+  [switch] $Required,
+  [switch] $CheckOnly,
+  [switch] $CheckBuildEnvironment
 )
 $ErrorActionPreference = 'Stop'
 
@@ -37,12 +45,19 @@ function Write-Warn([string] $Message) {
   if ($env:GITHUB_ACTIONS) { Write-Output "::warning::$Message" } else { Write-Warning $Message }
 }
 
+# A file this step signed must carry a complete, valid Authenticode signature.
+function Assert-AuthenticodeSignature($Signature) {
+  if (-not $Signature -or [string]$Signature.Status -cne 'Valid' -or -not $Signature.SignerCertificate) {
+    throw 'Required signing must produce a valid Authenticode signature and signer certificate'
+  }
+}
+
 function Find-SignTool {
   if ($env:SIGNTOOL) { return $env:SIGNTOOL }
   $onPath = Get-Command signtool.exe -ErrorAction SilentlyContinue
   if ($onPath) { return $onPath.Source }
   $kits = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
-  $found = Get-ChildItem -Path $kits -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+  $found = Get-ChildItem -LiteralPath $kits -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
     Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
     Sort-Object FullName -Descending | Select-Object -First 1
   if (-not $found) { throw 'signtool.exe not found (install the Windows SDK)' }
@@ -54,10 +69,28 @@ function Invoke-SignTool([string[]] $Arguments) {
   if ($LASTEXITCODE -ne 0) { throw "signtool $($Arguments[0]) failed with exit code $LASTEXITCODE" }
 }
 
-$Files = $Files | ForEach-Object { (Resolve-Path $_).Path }
-$haveCert = [bool]$env:WINDOWS_CERTIFICATE
 $azureVars = 'AZURE_TENANT_ID', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET', 'AZURE_SIGNING_ENDPOINT', 'AZURE_SIGNING_ACCOUNT', 'AZURE_CERT_PROFILE'
+# Compilation runs this instead of signing: no key may reach a build, and no file is touched.
+if ($CheckBuildEnvironment) {
+  if ($Required -or $CheckOnly -or $Files) { throw '-CheckBuildEnvironment is separate from signing' }
+  $names = @('WINDOWS_CERTIFICATE', 'WINDOWS_CERTIFICATE_PASSWORD') + $azureVars
+  if ($names | Where-Object { [Environment]::GetEnvironmentVariable($_) }) {
+    throw 'Compilation must not receive signing credentials; use a separate trusted signing step'
+  }
+  return
+}
+$haveCert = [bool]$env:WINDOWS_CERTIFICATE
 $haveAzure = -not ($azureVars | Where-Object { -not [Environment]::GetEnvironmentVariable($_) })
+
+if ($Required -and -not $haveCert -and -not $haveAzure) {
+  throw 'Nightly signing is required: configure WINDOWS_CERTIFICATE or the complete existing Azure signing configuration'
+}
+if ($CheckOnly) {
+  if ($Files) { throw '-CheckOnly does not sign files' }
+  return
+}
+if (-not $Files) { throw 'At least one file is required for signing' }
+$Files = $Files | ForEach-Object { (Resolve-Path -LiteralPath $_).Path }
 
 if (-not $haveCert -and -not $haveAzure) {
   Write-Warn "Windows signing secrets not set (WINDOWS_CERTIFICATE or AZURE_*): leaving unsigned: $($Files -join ', ')"
@@ -86,12 +119,12 @@ try {
     $pkg = Join-Path $tmp 'trusted-signing.zip'
     $version = $TrustedSigningClient.Version
     Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.Trusted.Signing.Client/$version" -OutFile $pkg
-    $sha256 = (Get-FileHash -Algorithm SHA256 -Path $pkg).Hash
+    $sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pkg).Hash
     if ($sha256 -ne $TrustedSigningClient.Sha256) {
       throw "Microsoft.Trusted.Signing.Client $version has SHA-256 $sha256, expected $($TrustedSigningClient.Sha256): refusing to load it"
     }
-    Expand-Archive -Path $pkg -DestinationPath (Join-Path $tmp 'client') -Force
-    $dlib = Get-ChildItem -Path (Join-Path $tmp 'client') -Recurse -Filter Azure.CodeSigning.Dlib.dll |
+    Expand-Archive -LiteralPath $pkg -DestinationPath (Join-Path $tmp 'client') -Force
+    $dlib = Get-ChildItem -LiteralPath (Join-Path $tmp 'client') -Recurse -Filter Azure.CodeSigning.Dlib.dll |
       Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
     if (-not $dlib) { throw 'Azure.CodeSigning.Dlib.dll not found in Microsoft.Trusted.Signing.Client' }
     $metadata = Join-Path $tmp 'metadata.json'
@@ -99,12 +132,15 @@ try {
       Endpoint               = $env:AZURE_SIGNING_ENDPOINT
       CodeSigningAccountName = $env:AZURE_SIGNING_ACCOUNT
       CertificateProfileName = $env:AZURE_CERT_PROFILE
-    } | ConvertTo-Json | Set-Content -Path $metadata -Encoding utf8
+    } | ConvertTo-Json | Set-Content -LiteralPath $metadata -Encoding utf8
     $ts = if ($env:WINDOWS_TIMESTAMP_URL) { $env:WINDOWS_TIMESTAMP_URL } else { 'http://timestamp.acs.microsoft.com' }
     Invoke-SignTool ($common + @('/tr', $ts, '/dlib', $dlib.FullName, '/dmdf', $metadata) + $Files)
   }
   Invoke-SignTool (@('verify', '/pa', '/v') + $Files)
+  if ($Required) {
+    foreach ($file in $Files) { Assert-AuthenticodeSignature (Get-AuthenticodeSignature -LiteralPath $file) }
+  }
 }
 finally {
-  Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }

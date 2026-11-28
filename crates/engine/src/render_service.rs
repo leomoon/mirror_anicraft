@@ -13,6 +13,21 @@
 //! the picture is always complete. Keys include which rasterizer drew them. A rasterizer may
 //! keep its pictures on the GPU ([`Raster::Native`], ADR 0029): the cache then holds them, under
 //! a budget of their own, and only the shell knows what they are.
+//!
+//! **What the cache keeps (ADR 0132).** Every picture belongs to a *picture set*: one document
+//! state at one scale ([`set_key`]). The stage says which set it shows
+//! ([`RenderService::show`]); the cache keeps that set and the one shown before it, and lets the
+//! others go at once. A drag makes a new state on every pointer move and a zoom gesture a new
+//! scale on every frame: their pictures can never be asked for again, so memory follows what is
+//! on screen and the frames played, not how long the document has been edited. The byte budgets
+//! still bound the sets that are kept.
+//!
+//! **Order of work.** What the screen needs is drawn before any look-ahead, in batches of its
+//! own, so a visible tile never waits for a tile nobody sees yet.
+//!
+//! **Without a render thread** (the browser, ADR 0036) a request draws on the caller's thread.
+//! [`RenderService::request_batch_within`] stops after a time budget, so moving around the stage
+//! costs a bounded part of each frame and the rest arrives over the next frames.
 
 use crate::editing::Front;
 use crate::history::StateId;
@@ -32,6 +47,8 @@ pub struct FrameJob {
     pub key: u64,
     /// Which rasterizer the key was made for (0: the CPU oracle); see [`RenderService::job`].
     pub raster: u64,
+    /// The picture set the image belongs to ([`set_key`]): the cache keeps the newest sets.
+    pub set: u64,
     /// Identity of the evaluated scene (`scene_key`): tiles of one frame share it.
     pub scene: u64,
     pub doc: Document,
@@ -45,9 +62,31 @@ pub struct FrameJob {
     /// A symbol open in place, in front of the picture (ADR 0045): onion skin composes its own
     /// frames (ADR 0051). Set with [`FrameJob::inside`].
     pub front: Option<Arc<Front>>,
+    /// The reference videos' pictures for this frame (ADR 0116): the stage's alone, never an
+    /// export's. Set with [`FrameJob::with_reference`].
+    pub reference: Option<Arc<Vec<crate::video::RefFrame>>>,
 }
 
 impl FrameJob {
+    /// The same job with the reference videos' pictures `frames` under the artwork, keyed
+    /// apart by which pictures they are.
+    pub fn with_reference(mut self, frames: Option<Arc<Vec<crate::video::RefFrame>>>) -> FrameJob {
+        if let Some(f) = frames.filter(|f| !f.is_empty()) {
+            let mix = |k: u64| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (k, "video").hash(&mut h);
+                for r in f.iter() {
+                    (r.element.0, r.serial).hash(&mut h);
+                }
+                h.finish()
+            };
+            self.key = mix(self.key);
+            self.scene = mix(self.scene);
+            self.reference = Some(f);
+        }
+        self
+    }
+
     /// The same job seen through the scene's camera (`on`), keyed apart from the plain one.
     pub fn through_camera(mut self, on: bool) -> FrameJob {
         if on && !self.camera {
@@ -86,10 +125,14 @@ impl FrameJob {
     /// symbol's own timeline when there is one (ADR 0051).
     pub fn display_list(&self) -> DisplayList {
         let onion = self.onion.as_ref().filter(|o| o.shows());
-        match (&self.front, onion) {
+        let mut dl = match (&self.front, onion) {
             (Some(front), Some(skin)) => display_list_inside(&self.doc, self.frame, front, skin),
             _ => display_list_for(&self.doc, self.frame, self.onion.as_ref(), self.camera),
+        };
+        if let Some(frames) = &self.reference {
+            crate::video::fill(&mut dl, frames);
         }
+        dl
     }
 }
 
@@ -143,6 +186,8 @@ fn parent_onion(doc: &Document, p: &crate::editing::Around, front: &Front, skin:
 /// already on the GPU.
 pub struct FrameImage {
     pub key: u64,
+    /// The picture set it belongs to ([`set_key`]).
+    pub set: u64,
     pub frame: u32,
     pub width: u32,
     pub height: u32,
@@ -187,6 +232,18 @@ pub fn scene_key(state: StateId, frame: u32, onion: Option<&OnionSkin>) -> u64 {
     h.finish()
 }
 
+/// Identity of a **picture set** (ADR 0132): every picture of document state `state` at `view`'s
+/// scale and turn, whatever the frame, the tile or the overlays. Where the view is doesn't
+/// count, so every tile of a stage view is in one set, and so are the frames played at it.
+pub fn set_key(state: StateId, view: &View) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (state, "set").hash(&mut h);
+    for v in view.transform.m.iter().take(4) {
+        v.to_bits().hash(&mut h);
+    }
+    h.finish()
+}
+
 /// Cache key for a scene seen through a view (a frame or a tile).
 pub fn frame_key(state: StateId, frame: u32, view: &View, onion: Option<&OnionSkin>) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -207,7 +264,7 @@ pub fn frame_key(state: StateId, frame: u32, view: &View, onion: Option<&OnionSk
 /// A job whose `scene` is derived from the same inputs as its key.
 pub fn make_job(state: StateId, doc: &Document, frame: u32, view: View, onion: Option<&OnionSkin>) -> FrameJob {
     let onion = onion.filter(|o| o.shows()).copied();
-    FrameJob { key: frame_key(state, frame, &view, onion.as_ref()), raster: 0, scene: scene_key(state, frame, onion.as_ref()), doc: doc.clone(), frame, view, onion, camera: false, front: None }
+    FrameJob { key: frame_key(state, frame, &view, onion.as_ref()), raster: 0, set: set_key(state, &view), scene: scene_key(state, frame, onion.as_ref()), doc: doc.clone(), frame, view, onion, camera: false, front: None, reference: None }
 }
 
 /// A job for rasterizer `raster` (from [`RenderService::raster_id`]; 0 is the CPU oracle, and
@@ -249,7 +306,7 @@ fn render_job_by(job: &FrameJob, dl: &DisplayList, raster: Option<&Rasterizer>) 
         let (w, h) = (job.view.width, job.view.height);
         let done = |rgba_premul: Vec<u8>, native: Option<NativeImage>, stats: RenderStats| {
             let ms = t0.elapsed().as_secs_f32() * 1000.0;
-            FrameImage { key: job.key, frame: job.frame, width: w, height: h, rgba_premul, native, ms, stats, error: None, gpu: true, fallback: None }
+            FrameImage { key: job.key, set: job.set, frame: job.frame, width: w, height: h, rgba_premul, native, ms, stats, error: None, gpu: true, fallback: None }
         };
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r(dl, &job.view))) {
             Ok(Ok((Raster::Premul8(rgba), stats))) if rgba.len() == w as usize * h as usize * 4 => return done(rgba, None, stats),
@@ -266,7 +323,7 @@ fn render_job_by(job: &FrameJob, dl: &DisplayList, raster: Option<&Rasterizer>) 
         Err(_) => (Vec::new(), RenderStats::default(), Some("the renderer failed on this frame".into())),
     };
     let (width, height) = if error.is_none() { (job.view.width, job.view.height) } else { (0, 0) };
-    FrameImage { key: job.key, frame: job.frame, width, height, rgba_premul: rgba, native: None, ms: t0.elapsed().as_secs_f32() * 1000.0, stats, error, gpu: false, fallback }
+    FrameImage { key: job.key, set: job.set, frame: job.frame, width, height, rgba_premul: rgba, native: None, ms: t0.elapsed().as_secs_f32() * 1000.0, stats, error, gpu: false, fallback }
 }
 
 /// Renders a job synchronously, evaluating its scene.
@@ -279,13 +336,24 @@ pub fn render_batch(jobs: &[FrameJob]) -> Vec<FrameImage> {
     render_batch_by(jobs, &RasterSlot::default())
 }
 
+/// Evaluated scenes by [`FrameJob::scene`].
+type Scenes = HashMap<u64, Arc<DisplayList>>;
+
 /// [`render_batch`] with the service's rasterizer for the jobs made for it.
 fn render_batch_by(jobs: &[FrameJob], slot: &RasterSlot) -> Vec<FrameImage> {
-    let mut scenes: HashMap<u64, Arc<DisplayList>> = HashMap::new();
+    render_batch_from(jobs, slot, &Scenes::new()).0
+}
+
+/// [`render_batch_by`], taking the scenes it needs from `known` when they are there (the pass
+/// before: a view and the look-ahead around it are several passes of one scene). The pictures,
+/// and this batch's scenes for the next.
+fn render_batch_from(jobs: &[FrameJob], slot: &RasterSlot, known: &Scenes) -> (Vec<FrameImage>, Scenes) {
+    let mut scenes = Scenes::new();
     for j in jobs {
-        scenes.entry(j.scene).or_insert_with(|| Arc::new(j.display_list()));
+        scenes.entry(j.scene).or_insert_with(|| known.get(&j.scene).cloned().unwrap_or_else(|| Arc::new(j.display_list())));
     }
-    jobs.par_iter()
+    let imgs = jobs
+        .par_iter()
         .map(|j| {
             // A job made for another rasterizer (queued before a switch) is drawn by the oracle.
             let raster = slot.raster.as_ref().filter(|_| j.raster != 0 && j.raster == slot.id);
@@ -294,7 +362,8 @@ fn render_batch_by(jobs: &[FrameJob], slot: &RasterSlot) -> Vec<FrameImage> {
                 None => render_job_by(j, &j.display_list(), raster),
             }
         })
-        .collect()
+        .collect();
+    (imgs, scenes)
 }
 
 /// The rasterizer in use and its id (0 and `None`: the oracle).
@@ -315,7 +384,17 @@ pub struct FrameCache {
     pub native_budget_bytes: usize,
     pub hits: u64,
     pub misses: u64,
+    /// How many times the cache was cleared: a picture whose drawing began before a clear
+    /// belongs to the document that was put aside, and is not kept.
+    cleared: u64,
+    /// The picture sets kept, the one on screen first (ADR 0132); empty until
+    /// [`FrameCache::show`] is first called, and then every set is kept.
+    recent: VecDeque<u64>,
 }
+
+/// Picture sets the cache keeps: the one on screen and the one before it, so undo then redo,
+/// or a zoom there and back, finds its pictures.
+pub const KEEP_SETS: usize = 2;
 
 /// `(bytes in memory, bytes on the GPU)` an image holds.
 fn cost(img: &FrameImage) -> (usize, usize) {
@@ -325,7 +404,7 @@ fn cost(img: &FrameImage) -> (usize, usize) {
 
 impl FrameCache {
     pub fn new(budget_bytes: usize) -> Self {
-        FrameCache { map: HashMap::new(), tick: 0, bytes: 0, native_bytes: 0, budget_bytes, native_budget_bytes: DEFAULT_NATIVE_CACHE_BYTES, hits: 0, misses: 0 }
+        FrameCache { map: HashMap::new(), tick: 0, bytes: 0, native_bytes: 0, budget_bytes, native_budget_bytes: DEFAULT_NATIVE_CACHE_BYTES, hits: 0, misses: 0, cleared: 0, recent: VecDeque::new() }
     }
     pub fn get(&mut self, key: u64) -> Option<Arc<FrameImage>> {
         self.tick += 1;
@@ -345,7 +424,39 @@ impl FrameCache {
     pub fn contains(&self, key: u64) -> bool {
         self.map.contains_key(&key)
     }
+    /// The stage shows picture set `set` from now on: it and the set shown before it are kept,
+    /// and the pictures of every other set go. How many went.
+    pub fn show(&mut self, set: u64) -> usize {
+        if self.recent.front() == Some(&set) {
+            return 0;
+        }
+        // Shown again (undo then redo): it moves to the front and nothing goes.
+        if let Some(at) = self.recent.iter().position(|s| *s == set) {
+            self.recent.remove(at);
+            self.recent.push_front(set);
+            return 0;
+        }
+        self.recent.push_front(set);
+        self.recent.truncate(KEEP_SETS);
+        let gone: Vec<u64> = self.map.iter().filter(|(_, (i, _))| !self.recent.contains(&i.set)).map(|(&k, _)| k).collect();
+        for k in &gone {
+            if let Some((old, _)) = self.map.remove(k) {
+                self.forget(&old);
+            }
+        }
+        gone.len()
+    }
+
+    /// Whether pictures of `set` are kept (all are until a set is shown).
+    pub fn keeps(&self, set: u64) -> bool {
+        self.recent.is_empty() || self.recent.contains(&set)
+    }
+
     pub fn insert(&mut self, img: Arc<FrameImage>) {
+        // Drawn for a set that is no longer kept (it finished late): nobody will ask for it.
+        if !self.keeps(img.set) {
+            return;
+        }
         self.tick += 1;
         let (cpu, gpu) = cost(&img);
         if let Some((old, _)) = self.map.insert(img.key, (img, self.tick)) {
@@ -371,6 +482,14 @@ impl FrameCache {
         let (cpu, gpu) = cost(img);
         self.bytes = self.bytes.saturating_sub(cpu);
         self.native_bytes = self.native_bytes.saturating_sub(gpu);
+    }
+    /// Forgets every picture (the document they show is no longer on screen, ADR 0112).
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.bytes = 0;
+        self.native_bytes = 0;
+        self.cleared += 1;
+        self.recent.clear();
     }
     pub fn len(&self) -> usize {
         self.map.len()
@@ -403,6 +522,9 @@ struct Shared {
     wake: Condvar,
     cache: Mutex<FrameCache>,
     notify: Option<Box<dyn Fn() + Send + Sync>>,
+    /// The scene last evaluated on the caller's thread (no render thread): the frames a view
+    /// takes to fill in share it.
+    scene: Mutex<Option<(u64, Arc<DisplayList>)>>,
 }
 
 /// Default image-cache budget.
@@ -411,6 +533,12 @@ pub const DEFAULT_CACHE_BYTES: usize = 768 * 1024 * 1024;
 pub const DEFAULT_NATIVE_CACHE_BYTES: usize = 384 * 1024 * 1024;
 /// Most jobs the worker renders in one parallel pass.
 const BATCH: usize = 32;
+
+/// Most look-ahead jobs in one pass: one per thread, so a pass takes about as long as one
+/// picture and what the screen asks for meanwhile starts that soon.
+pub fn lookahead_batch() -> usize {
+    rayon::current_num_threads().clamp(1, BATCH)
+}
 
 /// A render thread plus its cache.
 pub struct RenderService {
@@ -422,10 +550,33 @@ impl RenderService {
     /// Starts the worker. `notify` runs on the worker after each finished batch (the UI passes
     /// "request a repaint"). If no thread can be spawned, requests render synchronously.
     pub fn new(cache_bytes: usize, notify: Option<Box<dyn Fn() + Send + Sync>>) -> RenderService {
-        let shared = Arc::new(Shared { queue: Mutex::new(Queue::default()), raster: Mutex::new(RasterSlot::default()), wake: Condvar::new(), cache: Mutex::new(FrameCache::new(cache_bytes)), notify });
+        let shared = Self::shared(cache_bytes, notify);
         let s = shared.clone();
         let worker = std::thread::Builder::new().name("anicraft-render".into()).spawn(move || worker_loop(&s)).ok();
         RenderService { shared, worker }
+    }
+
+    /// A service with no render thread, as in the browser (ADR 0036): requests draw on the
+    /// caller's thread. On builds that have threads, this is how that way of working is
+    /// measured and tested.
+    pub fn without_thread(cache_bytes: usize) -> RenderService {
+        RenderService { shared: Self::shared(cache_bytes, None), worker: None }
+    }
+
+    fn shared(cache_bytes: usize, notify: Option<Box<dyn Fn() + Send + Sync>>) -> Arc<Shared> {
+        Arc::new(Shared { queue: Mutex::new(Queue::default()), raster: Mutex::new(RasterSlot::default()), wake: Condvar::new(), cache: Mutex::new(FrameCache::new(cache_bytes)), notify, scene: Mutex::new(None) })
+    }
+
+    /// Whether pictures are drawn on a render thread (not in the browser).
+    pub fn has_thread(&self) -> bool {
+        self.worker.is_some()
+    }
+
+    /// The stage shows picture set `set` (a job's [`FrameJob::set`]) from now on: the cache
+    /// keeps it and the set before it and lets the rest go (ADR 0132). Cheap when nothing
+    /// changed, so the stage calls it every frame.
+    pub fn show(&self, set: u64) {
+        self.cache().show(set);
     }
 
     fn cache(&self) -> std::sync::MutexGuard<'_, FrameCache> {
@@ -468,6 +619,18 @@ impl RenderService {
     /// Images that are ready, in order; the missing ones become the new urgent batch
     /// (replacing any older pending batch).
     pub fn request_batch(&self, jobs: Vec<FrameJob>) -> Vec<Option<Arc<FrameImage>>> {
+        self.request_some(jobs, None)
+    }
+
+    /// [`RenderService::request_batch`] for moving around a picture (a pan, a zoom that has
+    /// come to rest): with no render thread, drawing stops once `budget` is spent (after at
+    /// least one picture), and the rest come back `None` to be asked for again next frame, in
+    /// the order given. With a render thread nothing is drawn here and the budget is not used.
+    pub fn request_batch_within(&self, jobs: Vec<FrameJob>, budget: std::time::Duration) -> Vec<Option<Arc<FrameImage>>> {
+        self.request_some(jobs, Some(budget))
+    }
+
+    fn request_some(&self, jobs: Vec<FrameJob>, budget: Option<std::time::Duration>) -> Vec<Option<Arc<FrameImage>>> {
         let mut out = Vec::with_capacity(jobs.len());
         let mut missing = Vec::new();
         {
@@ -487,11 +650,15 @@ impl RenderService {
         }
         if self.worker.is_none() {
             // No thread available: render here, so the caller still gets pictures.
-            let imgs: Vec<Arc<FrameImage>> = render_batch_by(&missing, &self.slot()).into_iter().map(Arc::new).collect();
+            let imgs: Vec<Arc<FrameImage>> = match budget {
+                None => render_batch_by(&missing, &self.slot()).into_iter().map(Arc::new).collect(),
+                Some(budget) => self.render_within(&missing, budget),
+            };
             let mut cache = self.cache();
             for img in &imgs {
                 cache.insert(img.clone());
             }
+            // In order: the ones the budget left out stay `None`.
             let mut it = imgs.into_iter();
             for slot in out.iter_mut().filter(|s| s.is_none()) {
                 *slot = it.next();
@@ -503,6 +670,33 @@ impl RenderService {
         q.urgent = missing.into_iter().filter(|j| !busy.contains(&j.key)).collect();
         if !q.urgent.is_empty() {
             self.shared.wake.notify_one();
+        }
+        out
+    }
+
+    /// The first of `jobs`, one after another on this thread, until `budget` is spent (always
+    /// at least one). Their scene is evaluated once and kept for the next call.
+    fn render_within(&self, jobs: &[FrameJob], budget: std::time::Duration) -> Vec<Arc<FrameImage>> {
+        let started = Instant::now();
+        let slot = self.slot();
+        let mut out = Vec::new();
+        for j in jobs {
+            if !out.is_empty() && started.elapsed() >= budget {
+                break;
+            }
+            let dl = {
+                let mut memo = self.shared.scene.lock().unwrap_or_else(PoisonError::into_inner);
+                match memo.as_ref().filter(|(k, _)| *k == j.scene) {
+                    Some((_, dl)) => dl.clone(),
+                    None => {
+                        let dl = Arc::new(j.display_list());
+                        *memo = Some((j.scene, dl.clone()));
+                        dl
+                    }
+                }
+            };
+            let raster = slot.raster.as_ref().filter(|_| j.raster != 0 && j.raster == slot.id);
+            out.push(Arc::new(render_job_by(j, &dl, raster)));
         }
         out
     }
@@ -546,10 +740,10 @@ impl RenderService {
 
     /// Single-image form of [`RenderService::render_now_batch`].
     pub fn render_now(&self, job: FrameJob) -> Arc<FrameImage> {
-        let key = job.key;
+        let (key, set) = (job.key, job.set);
         let frame = job.frame;
         self.render_now_batch(vec![job]).into_iter().next().unwrap_or_else(|| {
-            Arc::new(FrameImage { key, frame, width: 0, height: 0, rgba_premul: Vec::new(), native: None, ms: 0.0, stats: RenderStats::default(), error: Some("render failed".into()), gpu: false, fallback: None })
+            Arc::new(FrameImage { key, set, frame, width: 0, height: 0, rgba_premul: Vec::new(), native: None, ms: 0.0, stats: RenderStats::default(), error: Some("render failed".into()), gpu: false, fallback: None })
         })
     }
 
@@ -573,6 +767,25 @@ impl RenderService {
     pub fn busy(&self) -> bool {
         let q = self.queue();
         !q.busy.is_empty() || !q.urgent.is_empty() || !q.prefetch.is_empty()
+    }
+
+    /// Forgets every finished picture, in memory and on the GPU: an editor showing another
+    /// document calls it, so the one put aside keeps no pictures (ADR 0112).
+    ///
+    /// Work still waiting is dropped, and a batch the worker is drawing right now is thrown
+    /// away when it finishes (it began before the clear), so nothing of that document comes
+    /// back into the cache afterwards.
+    pub fn forget_pictures(&self) {
+        {
+            // The cache is cleared while the queue is held, so the worker takes a batch either
+            // before the clear (and sees the older count, throwing the batch away) or after it
+            // (and finds the queue empty). Lock order: queue, then cache.
+            let mut q = self.queue();
+            q.urgent.clear();
+            q.prefetch.clear();
+            self.cache().clear();
+        }
+        *self.shared.scene.lock().unwrap_or_else(PoisonError::into_inner) = None;
     }
 
     /// `(images, bytes, hits, misses)`.
@@ -610,44 +823,63 @@ impl Drop for RenderService {
 }
 
 fn worker_loop(s: &Shared) {
+    // The scenes of the pass before, for the passes of one view.
+    let mut scenes = Scenes::new();
     loop {
         // Take a whole batch: urgent first, topped up with prefetch work.
-        let jobs: Vec<FrameJob> = {
+        let (jobs, cleared): (Vec<FrameJob>, u64) = {
             let mut q = s.queue.lock().unwrap_or_else(PoisonError::into_inner);
             loop {
                 if q.shutdown {
                     return;
                 }
                 if !q.urgent.is_empty() || !q.prefetch.is_empty() {
+                    // What the screen needs, alone: a visible tile never waits for look-ahead
+                    // drawn in the same pass. Look-ahead goes in short passes, so the next
+                    // urgent batch starts soon (ADR 0132).
+                    let urgent = !q.urgent.is_empty();
+                    let most = if urgent { BATCH } else { lookahead_batch() };
                     let mut batch = Vec::new();
-                    while batch.len() < BATCH {
-                        let Some(j) = q.urgent.pop_front().or_else(|| q.prefetch.pop_front()) else { break };
+                    while batch.len() < most {
+                        let Some(j) = (if urgent { q.urgent.pop_front() } else { q.prefetch.pop_front() }) else { break };
                         batch.push(j);
                     }
                     for j in &batch {
                         q.busy.insert(j.key);
                     }
-                    break batch;
+                    // Read while the queue is held, as `forget_pictures` clears the cache: a
+                    // batch taken before a clear is always seen as older than it.
+                    let cleared = s.cache.lock().unwrap_or_else(PoisonError::into_inner).cleared;
+                    break (batch, cleared);
                 }
                 q = s.wake.wait(q).unwrap_or_else(PoisonError::into_inner);
             }
         };
         let todo: Vec<FrameJob> = {
             let cache = s.cache.lock().unwrap_or_else(PoisonError::into_inner);
-            jobs.iter().filter(|j| !cache.contains(j.key)).cloned().collect()
+            // Not what is cached already, nor what the cache would not keep (its set went).
+            jobs.iter().filter(|j| !cache.contains(j.key) && cache.keeps(j.set)).cloned().collect()
         };
         let slot = s.raster.lock().unwrap_or_else(PoisonError::into_inner).clone();
-        let imgs = render_batch_by(&todo, &slot);
+        let (imgs, evaluated) = render_batch_from(&todo, &slot, &scenes);
+        scenes = evaluated;
         {
             let mut cache = s.cache.lock().unwrap_or_else(PoisonError::into_inner);
-            for img in imgs {
-                cache.insert(Arc::new(img));
+            // Cleared meanwhile (`forget_pictures`): these show a document put aside.
+            if cache.cleared == cleared {
+                for img in imgs {
+                    cache.insert(Arc::new(img));
+                }
             }
         }
         {
             let mut q = s.queue.lock().unwrap_or_else(PoisonError::into_inner);
             for j in &jobs {
                 q.busy.remove(&j.key);
+            }
+            // Nothing more to draw: an idle worker holds no document's scene.
+            if q.urgent.is_empty() && q.prefetch.is_empty() {
+                scenes.clear();
             }
         }
         if let Some(n) = &s.notify {
@@ -678,6 +910,28 @@ mod tests {
         assert_eq!(img.rgba_premul, direct.rgba_premul);
         // second request is a cache hit
         assert!(svc.request(j).is_some());
+    }
+
+    /// Forgetting the pictures (another document is shown, ADR 0112) also covers the ones
+    /// still being drawn: none of them lands in the cache afterwards.
+    #[test]
+    fn pictures_in_progress_are_not_kept_once_forgotten() {
+        let doc = sample::demo();
+        for round in 0..20u64 {
+            let svc = RenderService::new(64 << 20, None);
+            svc.prefetch((0..8).map(|f| job(&doc, 100 + round, f)).collect());
+            // At a different moment of the worker's batch each round.
+            std::thread::sleep(std::time::Duration::from_micros(round * 150));
+            svc.forget_pictures();
+            for _ in 0..10_000 {
+                if !svc.busy() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(!svc.busy(), "the worker finished");
+            assert_eq!(svc.cache_stats().0, 0, "round {round}: a picture drawn for the forgotten document was kept");
+        }
     }
 
     #[test]
@@ -803,7 +1057,7 @@ mod tests {
     fn cache_respects_budget_lru() {
         let mut c = FrameCache::new(3 * 1000);
         for k in 0..10u64 {
-            c.insert(Arc::new(FrameImage { key: k, frame: 0, width: 0, height: 0, rgba_premul: vec![0; 800], native: None, ms: 0.0, stats: RenderStats::default(), error: None, gpu: false, fallback: None }));
+            c.insert(Arc::new(FrameImage { key: k, set: 0, frame: 0, width: 0, height: 0, rgba_premul: vec![0; 800], native: None, ms: 0.0, stats: RenderStats::default(), error: None, gpu: false, fallback: None }));
         }
         assert!(c.bytes() <= 3000);
         assert!(c.contains(9) && !c.contains(0));
@@ -817,7 +1071,7 @@ mod tests {
         c.native_budget_bytes = 1000;
         let img = |k: u64, native: bool| {
             let n: Option<NativeImage> = native.then(|| Arc::new(k) as NativeImage);
-            Arc::new(FrameImage { key: k, frame: 0, width: 10, height: 10, rgba_premul: if native { Vec::new() } else { vec![0; 400] }, native: n, ms: 0.0, stats: RenderStats::default(), error: None, gpu: native, fallback: None })
+            Arc::new(FrameImage { key: k, set: 0, frame: 0, width: 10, height: 10, rgba_premul: if native { Vec::new() } else { vec![0; 400] }, native: n, ms: 0.0, stats: RenderStats::default(), error: None, gpu: native, fallback: None })
         };
         c.insert(img(100, false));
         for k in 0..5 {

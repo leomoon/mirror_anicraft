@@ -15,25 +15,44 @@ repository = "https://github.com/storytold/AniCraft"
 rust-version = "1.95"
 
 [workspace.dependencies]
+craft-video = { git = "https://github.com/storytold/craft-libs", rev = "fd91be74f078d7062945ff6512cf65afea0c73ac", default-features = false, features = ["screen-video"] }
+craft-palette = { git = "https://github.com/storytold/craft-libs", rev = "de97c35f2b2af01c62371647e57a6affeab456fd" }
+craft-lottie = { git = "https://github.com/storytold/craft-libs", rev = "83cb1133dd2bdd0d655ba2300f88863f0f53db0b" }
 anicraft-geom = { path = "crates/geom" }
 anicraft-doc = { path = "crates/doc" }
 anicraft-render = { path = "crates/render" }
 anicraft-engine = { path = "crates/engine" }
 anicraft-xfl = { path = "crates/xfl" }
+anicraft-fla = { path = "crates/fla" }
 anicraft-xml = { path = "crates/xml" }
+anicraft-flamedia = { path = "crates/flamedia" }
 anicraft-svg = { path = "crates/svg" }
 anicraft-text = { path = "crates/text" }
 anicraft-plugins = { path = "crates/plugins" }
 anicraft-audio = { path = "crates/audio" }
 anicraft-gpu = { path = "crates/gpu" }
 anicraft-guide = { path = "crates/guide" }
-craft-anicraft-format = { git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18" }
-craft-audio = { git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18", default-features = false, features = ["decode", "pcm-encode"] }
+craft-anicraft-format = { git = "https://github.com/storytold/craft-libs", rev = "08da5e1486ee640de1d2cccd8fe8dd32b1d3b62c" }
+craft-svg = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "d20a82481b1f7b1d32c818b19c620338af9755d3", default-features = false }
+craft-mime = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18" }
+craft-html = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18", default-features = false }
+craft-audio = { git = "https://github.com/storytold/craft-libs", rev = "e2bf53f2bdba4828e21097774a568ed9c74b0004", default-features = false, features = ["decode", "pcm-encode"] }
 craft-gif = { git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18" }
+# Isolate the already-merged APNG container from the existing raster-codec pin.
+craft-apng-container = { package = "craft-image-codecs", version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "55b1d7f3c598b600a130ae63f4a40334a230ae7b", default-features = false }
 craft-image-codecs = { git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18" }
-craft-webp = { git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18" }
-craft-xfl = { git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18" }
-craft-xml = { git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18" }
+craft-webp = { git = "https://github.com/storytold/craft-libs", rev = "0c144b7d983899d4b5b281046dd03a8b1ab35fbb" }
+craft-xfl = { git = "https://github.com/storytold/craft-libs", rev = "b67b9f90c50091a3090f93fa054c34e409edba11" }
+# Delimited text (CSV, TSV) for data tables (ADR 0118): encoding and delimiter detection and a
+# bounded record parser. The same reviewed commit as craft-mime and craft-gif.
+craft-csv = { git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18" }
+craft-xml = { git = "https://github.com/storytold/craft-libs", rev = "b67b9f90c50091a3090f93fa054c34e409edba11" }
+# The compound binary container ([MS-CFB]) of legacy Flash 8–CS4 .fla files (ADR 0120). The same
+# reviewed commit as craft-xfl and craft-xml.
+craft-cfb = { git = "https://github.com/storytold/craft-libs", rev = "b67b9f90c50091a3090f93fa054c34e409edba11" }
+# The Unicode bidi algorithm (UAX #9) for text that mixes directions (ADR 0130): only the `bidi`
+# module, which brings unicode-bidi and unicode-bidi-mirroring (both MIT OR Apache-2.0).
+craft-text = { git = "https://github.com/storytold/craft-libs", rev = "f0f4758c01581d79577b9bf5046c06f4e77b1f18", default-features = false, features = ["bidi"] }
 # The GPU stage (ADR 0019) uses the wgpu that eframe's egui-wgpu brings, with the same
 # (default) features, so the tree keeps one wgpu build.
 wgpu = "30"
@@ -45,18 +64,24 @@ anicraft-actions = { path = "crates/actions" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+clap_mangen = "0.2"
 rayon = "1"
+# Unions of flattened polygons on an integer grid, for a stroke's outline (ADR 0110): pure
+# Rust, no unsafe in our use, MIT OR Apache-2.0 (its i_float, i_shape, i_tree and i_key_sort: MIT).
+i_overlay = { version = "9.2", default-features = false }
 # wgpu is the primary renderer; glow (OpenGL) is the fallback for GPUs/VMs where wgpu fails.
 # Default features off: we skip `links` (opening web links pulls in url/idna/ICU Unicode
 # tables we don't use) and the web-only screen-reader shim. Same set as PhotoCraft, plus glow.
-eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "glow", "wayland", "x11"] }
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "glow", "wayland", "x11"] }
 # Native file dialogs: Windows common dialogs, macOS NSOpenPanel, Linux XDG desktop portal.
 rfd = "0.17"
 # Lists and loads the OS's installed fonts for Preferences › Appearance (MIT).
 # Without the `fontconfig` feature, Linux scans the standard font folders directly
 # (/usr/share/fonts, /usr/local/share/fonts, ~/.local/share/fonts, ~/.fonts).
 fontdb = { version = "0.23", default-features = false, features = ["std", "fs", "memmap"] }
-egui = "0.36"
+egui = "0.37"
 # `Instant` and `SystemTime` that work in the browser too (std's panic on wasm32-unknown-unknown);
 # on other targets a re-export of std::time (MIT OR Apache-2.0; already in the tree via winit).
 web-time = "1"
@@ -113,10 +138,16 @@ sys-locale = "0.3"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # The user guide, bundled for Help › User Guide (ADR 0069). The web build serves it as pages instead.
 anicraft-guide.workspace = true
+# The live control port and the tools it serves (ADR 0104): the same dispatcher as the
+# headless MCP server, so live and headless never drift.
+anicraft-cli = { path = "crates/cli" }
 craft-update = { git = "https://github.com/storytold/craft-libs", rev = "6ac2a6a34ae83fc0f0bfb25a569ba6388b72266a" }
 
 eframe = { workspace = true, features = ["links"] }
 rfd.workspace = true
+# Pictures copied in other apps, for Paste (#263). The clipboard library eframe already uses
+# for text (MIT OR Apache-2.0), with the same features, so no crate is added to the build.
+arboard = { version = "3.6", default-features = false, features = ["image-data"] }
 # Sound output (Apache-2.0): WASAPI on Windows, CoreAudio on macOS, ALSA on Linux and the BSDs.
 cpal = { version = "0.18", optional = true }
 
@@ -127,18 +158,24 @@ cpal = { version = "0.18", optional = true }
 # objc2 / objc2-app-kit / objc2-foundation are the versions wgpu already brings on macOS.
 [target.'cfg(target_os = "macos")'.dependencies]
 fmv-macos-events = "=0.1.0"
+# Waits for the answer of a file dialog shown as a sheet (`platform::start_file_dialog`).
+pollster.workspace = true
 
 # The system's high-contrast setting (ADR 0064): one registry value. MIT, already in the tree
 # through craft-update.
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
+# The Nightly build's explicit AppUserModelID, set before any window exists so the taskbar, the
+# Start menu and Alt-Tab keep Nightly apart from Stable (src/process_identity.rs). MIT, the same
+# version and features PhotoCraft pins; both modules are already in the tree through craft-update.
+winsafe = { version = "=0.0.29", default-features = false, features = ["user", "shell"] }
 
 # The web build (ADR 0036, docs/web.md). The window draws with WebGL2 (glow): every current
 # browser has it, the stage is drawn on the CPU there, and leaving wgpu out keeps the download
 # smaller. The browser glue is wasm-bindgen's (MIT OR Apache-2.0), already under eframe's web
 # backend.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"

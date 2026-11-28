@@ -18,8 +18,9 @@ use crate::actions::as3::ir::{Base, Function, ListenEvent, Place, Prop, Value};
 use crate::actions::as3::run::{self, Stop, World};
 use crate::actions::as3::{Compiled, Decls, Problem};
 use crate::actions::{Action, ButtonEvent, EventHandler, FrameRef, FrameScript, PluginScript, Property, Seg, Target};
-use crate::eval::{Play, evaluate_shown, evaluate_symbol, guide_walk};
+use crate::eval::{Play, Work, evaluate_shown, evaluate_symbol, guide_walk};
 use crate::field::{Changed, Edit, Editor, FieldLook, FieldState, chars, fit, scroll_to_caret};
+use crate::html_text::{self, RichStyles};
 use crate::sound::Started;
 use crate::{BlendMode, ColorTransform, DisplayList, Document, Element, ElementId, ElementKind, FIELD_GUTTER, Group, LayerKind, MAX_SYMBOL_DEPTH, Rgba, SoundSync, SymbolId, SymbolKind, TextBlock, TextField, TextKind, Timeline};
 use anicraft_geom::{Affine, Vec2};
@@ -37,6 +38,11 @@ pub const MAX_ACTIONS_PER_STEP: usize = 10_000;
 pub const MAX_ENTERS_PER_STEP: usize = 1_000;
 /// Most symbol instances the player follows.
 pub const MAX_NODES: usize = 10_000;
+/// The work one step may do looking at the movie (ADR 0128): every rebuild of the instance tree
+/// after a change and every pointer hit test in the step share it, in the units of
+/// [`crate::MAX_EVAL_ELEMENTS`]. Four full frames' worth: a movie that needs more in one step
+/// is one no machine plays in time, and a hostile one stops here instead of hanging.
+pub const MAX_WORK_PER_STEP: u32 = 4 * crate::MAX_EVAL_ELEMENTS;
 /// Most output lines one step keeps (more are counted).
 pub const MAX_OUTPUT_PER_STEP: usize = 1_000;
 /// Most pointer events one step handles.
@@ -367,8 +373,10 @@ pub trait ScriptHost {
     /// Lays out `shown` (a field's text as it is drawn) in `block`'s style and box (ADR 0066):
     /// the fonts live above this crate. `None`: it can't, and the field keeps its authored
     /// outline until its text changes (then it draws only its box).
-    fn lay_out_field(&mut self, block: &TextBlock, shown: &str) -> Option<FieldLook> {
-        let _ = (block, shown);
+    /// `rich`: the styles of the text when a script set them with `htmlText` (ADR 0107);
+    /// `None`: the block's own first style.
+    fn lay_out_field(&mut self, block: &TextBlock, shown: &str, rich: Option<&RichStyles>) -> Option<FieldLook> {
+        let _ = (block, shown, rich);
         None
     }
 }
@@ -453,18 +461,24 @@ pub fn input(doc: &Document, state: &PlayerState, events: &[Event], host: &mut d
 /// The instance tree at `state`: the main timeline (index 0), then every symbol instance in
 /// drawing order (parents before their contents).
 pub fn tree(doc: &Document, st: &PlayerState) -> Vec<Node> {
+    tree_in(doc, st, &Work::new(crate::MAX_EVAL_ELEMENTS))
+}
+
+/// [`tree`], paid for from `work`: once it is spent the rest of the movie is left out.
+fn tree_in(doc: &Document, st: &PlayerState, work: &Work) -> Vec<Node> {
     let tl = doc.timeline(st.scene);
     let mut out = vec![Node { path: Vec::new(), parent: None, owner: 0, name: String::new(), symbol: None, kind: NodeKind::Root, frame: st.root.frame, frames: tl.frame_count(), xf: Affine::IDENTITY, local: Affine::IDENTITY, alpha: 1.0, hittable: true, events: Vec::new(), gain: 1.0, text: None }];
     // The main timeline is seen through its camera (ADR 0027): instances are where the pointer
     // sees them.
     let camera = tl.camera_at(st.root.frame, &doc.stage);
-    walk(doc, st, tl, st.root.frame, 0, 0, Affine::IDENTITY, 1, true, camera, &mut out);
+    walk(doc, st, tl, st.root.frame, 0, 0, Affine::IDENTITY, 1, true, camera, work, &mut out);
     out
 }
 
 /// The button (or movie clip with event handlers) at stage point `p`, topmost first.
 pub fn hit(doc: &Document, st: &PlayerState, p: Vec2) -> Option<InstancePath> {
-    hit_in(doc, st, &tree(doc, st), p)
+    let work = Work::new(crate::MAX_EVAL_ELEMENTS);
+    hit_in(doc, st, &tree_in(doc, st, &work), p, &work)
 }
 
 /// The text field at stage point `p` the viewer can click into, topmost first (ADR 0066): what
@@ -502,8 +516,13 @@ pub fn hit_frame(len: u32) -> u32 {
 /// shapes count however faint they are drawn). The hit test and Test Movie's hit-area overlay
 /// both use it.
 pub fn hit_area(doc: &Document, tl: &Timeline, xf: Affine) -> DisplayList {
-    let mut dl = evaluate_symbol(doc, tl, hit_frame(tl.frame_count()), xf, None);
+    hit_area_in(doc, tl, xf, &Work::new(crate::MAX_EVAL_ELEMENTS))
+}
+
+fn hit_area_in(doc: &Document, tl: &Timeline, xf: Affine, work: &Work) -> DisplayList {
+    let mut dl = evaluate_symbol(doc, tl, hit_frame(tl.frame_count()), xf, None, work);
     dl.items.retain(|i| !i.guide && i.masks.is_none());
+    dl.links.clear();
     for i in &mut dl.items {
         i.clip = None;
     }
@@ -539,11 +558,14 @@ pub fn tinted(dl: DisplayList, tint: Rgba, alpha: f32) -> DisplayList {
 /// Areas): where the pointer finds the buttons, drawn over the movie.
 pub fn hit_overlay(doc: &Document, st: &PlayerState, tint: Rgba, alpha: f32) -> DisplayList {
     let mut out = DisplayList::default();
-    for n in tree(doc, st).iter().filter(|n| n.kind == NodeKind::Button && n.hittable) {
-        if let Some(sym) = n.symbol.and_then(|s| doc.symbol(s)) {
-            out.append(tinted(hit_area(doc, &sym.timeline, n.xf), tint, alpha));
+    // One allowance for the tree and every button's area, however many buttons there are.
+    let work = Work::new(crate::MAX_EVAL_ELEMENTS);
+    for n in tree_in(doc, st, &work).iter().filter(|n| n.kind == NodeKind::Button && n.hittable) {
+        if let Some(sym) = n.symbol.and_then(|s| work.symbol(doc, s)) {
+            out.append(tinted(hit_area_in(doc, &sym.timeline, n.xf, &work), tint, alpha));
         }
     }
+    out.left_out = work.ran_out();
     out
 }
 
@@ -554,7 +576,7 @@ fn plays(tl: &Timeline, index: usize) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn walk(doc: &Document, st: &PlayerState, tl: &Timeline, frame: u32, parent: usize, owner: usize, xf: Affine, depth: usize, hittable: bool, camera: Option<crate::Camera>, out: &mut Vec<Node>) {
+fn walk(doc: &Document, st: &PlayerState, tl: &Timeline, frame: u32, parent: usize, owner: usize, xf: Affine, depth: usize, hittable: bool, camera: Option<crate::Camera>, work: &Work, out: &mut Vec<Node>) {
     if depth > MAX_SYMBOL_DEPTH {
         return;
     }
@@ -563,12 +585,19 @@ fn walk(doc: &Document, st: &PlayerState, tl: &Timeline, frame: u32, parent: usi
     // Drawn deepest first (ADR 0082), so the topmost hit is the one drawn last.
     // (Only sorted when some layer has a depth: nested timelines allocate nothing.)
     let sorted = (depth == 1 && tl.layers.iter().any(|l| l.has_depth())).then(|| tl.draw_order(frame));
+    // Layers that follow a parent layer are placed by it (ADR 0113), as the evaluator does.
+    let rig = tl.has_rig().then(|| tl.rig_spaces(frame, doc.stage.fps));
     let n = tl.layers.len();
     for k in 0..n {
         let index = sorted.as_ref().map_or(n - 1 - k, |o| o.get(k).copied().unwrap_or(n));
         let Some(layer) = tl.layers.get(index) else { continue };
         if !plays(tl, index) {
             continue;
+        }
+        // Layers and elements are paid for as the evaluator pays for them, so a timeline of
+        // plain artwork, looked at once for every instance of it, is bounded too.
+        if !work.spend(1) {
+            return;
         }
         let gain = parent_gain * layer.sound_gain();
         let hit = hittable && layer.kind != LayerKind::Mask;
@@ -581,10 +610,14 @@ fn walk(doc: &Document, st: &PlayerState, tl: &Timeline, frame: u32, parent: usi
             },
             None => xf,
         };
+        let layer_xf = match rig.as_ref().and_then(|r| r.get(index)) {
+            Some(space) => layer_xf.mul(space),
+            None => layer_xf,
+        };
         // Instances inside a group belong to the group's timeline (ADR 0073).
         let els = crate::expand_groups(&els).into_owned();
         for el in els.iter() {
-            if out.len() >= MAX_NODES {
+            if out.len() >= MAX_NODES || !work.spend(1) {
                 return;
             }
             // Dynamic and input text fields are instances scripts can name (static text isn't).
@@ -601,7 +634,7 @@ fn walk(doc: &Document, st: &PlayerState, tl: &Timeline, frame: u32, parent: usi
                 continue;
             }
             let ElementKind::Symbol { symbol, loop_mode, first_frame, events, .. } = &el.kind else { continue };
-            let Some(sym) = doc.symbol(*symbol) else { continue };
+            let Some(sym) = work.symbol(doc, *symbol) else { continue };
             let mut path = base.clone();
             path.push(el.id);
             let ov = st.props.get(&path);
@@ -620,22 +653,27 @@ fn walk(doc: &Document, st: &PlayerState, tl: &Timeline, frame: u32, parent: usi
             // Names inside a movie clip (or a button's states) are its own; a graphic's
             // contents belong to the timeline the graphic is on.
             let inner_owner = if kind == NodeKind::Graphic { owner } else { idx };
-            walk(doc, st, &sym.timeline, local, idx, inner_owner, node_xf, depth + 1, hit && shown, None, out);
+            walk(doc, st, &sym.timeline, local, idx, inner_owner, node_xf, depth + 1, hit && shown, None, work, out);
         }
     }
 }
 
-fn hit_in(doc: &Document, st: &PlayerState, nodes: &[Node], p: Vec2) -> Option<InstancePath> {
+/// `work` pays for every area looked at: each interactive instance is evaluated to find the one
+/// under the pointer, and they share one allowance instead of having a whole frame's each.
+fn hit_in(doc: &Document, st: &PlayerState, nodes: &[Node], p: Vec2, work: &Work) -> Option<InstancePath> {
     for n in nodes.iter().rev() {
         let interactive = n.kind == NodeKind::Button || (n.kind == NodeKind::MovieClip && (!n.events.is_empty() || st.listeners.contains_key(&n.path)));
         if !n.hittable || !interactive {
             continue;
         }
-        let Some(sym) = n.symbol.and_then(|s| doc.symbol(s)) else { continue };
+        if work.ran_out() {
+            return None;
+        }
+        let Some(sym) = n.symbol.and_then(|s| work.symbol(doc, s)) else { continue };
         let dl = if n.kind == NodeKind::Button {
-            hit_area(doc, &sym.timeline, n.xf)
+            hit_area_in(doc, &sym.timeline, n.xf, work)
         } else {
-            evaluate_symbol(doc, &sym.timeline, n.frame, n.xf, Some(&Play { state: st, path: n.path.clone() }))
+            evaluate_symbol(doc, &sym.timeline, n.frame, n.xf, Some(&Play { state: st, path: n.path.clone() }), work)
         };
         let inside = dl.items.iter().filter(|i| !i.guide && i.masks.is_none()).any(|i| {
             let fill = i.fill.is_some() && i.path.contains(p, &i.transform, i.fill_rule);
@@ -684,11 +722,13 @@ struct Run<'a, 'h> {
     decls: BTreeMap<TimelineRef, Arc<Decls>>,
     /// Script fuel left this step.
     fuel: u64,
+    /// What is left of [`MAX_WORK_PER_STEP`].
+    work: Work,
 }
 
 impl<'a, 'h> Run<'a, 'h> {
     fn new(doc: &'a Document, st: PlayerState, host: &'h mut dyn ScriptHost) -> Self {
-        Run { doc, st, host, nodes: Vec::new(), dirty: true, pending: VecDeque::new(), actions: 0, enters: 0, halted: false, output: Vec::new(), dropped: 0, sounds: Vec::new(), graphics: BTreeMap::new(), decls: BTreeMap::new(), fuel: MAX_FUEL_PER_STEP }
+        Run { doc, st, host, nodes: Vec::new(), dirty: true, pending: VecDeque::new(), actions: 0, enters: 0, halted: false, output: Vec::new(), dropped: 0, sounds: Vec::new(), graphics: BTreeMap::new(), decls: BTreeMap::new(), fuel: MAX_FUEL_PER_STEP, work: Work::new(MAX_WORK_PER_STEP) }
     }
 
     fn remember_graphics(&mut self) {
@@ -766,6 +806,15 @@ impl<'a, 'h> Run<'a, 'h> {
         }
     }
 
+    /// The step's allowance of work ran out ([`MAX_WORK_PER_STEP`]): nothing more runs this
+    /// step, and the Output panel says why, once.
+    fn overworked(&mut self) {
+        if self.work.ran_out() && !self.halted {
+            self.halted = true;
+            self.out("Stopped this frame early: the movie holds more than one frame may look at, so some instances and buttons were left out (symbols nested in themselves?)");
+        }
+    }
+
     /// Rebuilds the instance tree after a change, starting movie clips that appeared (they
     /// enter their first frame) and forgetting those that left.
     fn refresh(&mut self) {
@@ -778,7 +827,8 @@ impl<'a, 'h> Run<'a, 'h> {
         }
         let n = self.doc.timeline(self.st.scene).frame_count();
         self.st.root.frame = self.st.root.frame.min(n.saturating_sub(1));
-        self.nodes = tree(self.doc, &self.st);
+        self.nodes = tree_in(self.doc, &self.st, &self.work);
+        self.overworked();
         let live: std::collections::BTreeSet<&InstancePath> = self.nodes.iter().filter(|n| n.kind == NodeKind::MovieClip).map(|n| &n.path).collect();
         self.st.clips.retain(|p, _| live.contains(p));
         for p in live {
@@ -1095,13 +1145,29 @@ impl<'a, 'h> Run<'a, 'h> {
                 Prop::MouseX => num(short(self.st.mouse.x)),
                 Prop::MouseY => num(short(self.st.mouse.y)),
                 Prop::Name => Ok(Value::str("root1")),
-                Prop::Text | Prop::Length => Err("the main timeline isn't a text field".into()),
+                Prop::Text | Prop::Length | Prop::HtmlText | Prop::MaxChars | Prop::Restrict => Err("the main timeline isn't a text field".into()),
             };
         }
-        if matches!(p, Prop::Text | Prop::Length) {
-            let Some((t, _)) = n.field() else { return Err(format!("“{}” is {}, not a text field", n.name, kind_name(n.kind))) };
-            let v = self.st.fields.get(&n.path).map_or(t.text.as_str(), |f| f.value(t));
-            return Ok(if p == Prop::Text { Value::str(v) } else { Value::Num(crate::actions::as3::ir::text_len(v) as f64) });
+        if p.is_field() {
+            let Some((t, f)) = n.field() else { return Err(format!("“{}” is {}, not a text field", n.name, kind_name(n.kind))) };
+            let st = self.st.fields.get(&n.path);
+            let v = st.map_or(t.text.as_str(), |f| f.value(t));
+            return Ok(match p {
+                Prop::Text => Value::str(v),
+                Prop::Length => Value::Num(crate::actions::as3::ir::text_len(v) as f64),
+                Prop::MaxChars => Value::Num(f64::from(st.and_then(|s| s.max_chars).unwrap_or(f.max_chars))),
+                Prop::Restrict => st.and_then(|s| s.restrict.as_deref()).map_or(Value::Null, Value::str),
+                // The text's styles as HTML: what a script set, the authored runs while the
+                // text is the authored one, else the field's own style.
+                _ => {
+                    let styles = match st {
+                        Some(FieldState { rich: Some(r), .. }) => (**r).clone(),
+                        Some(FieldState { text: Some(_), .. }) => RichStyles { runs: vec![crate::TextRun { chars: u32::MAX, style: t.char_style() }], paragraphs: vec![t.para_style()] },
+                        _ => RichStyles { runs: t.styled_runs(), paragraphs: t.paragraph_styles() },
+                    };
+                    Value::str(&html_text::write(v, &styles))
+                }
+            });
         }
         let ov = self.st.props.get(&n.path).copied().unwrap_or_default();
         let d = decompose64(&n.local);
@@ -1126,7 +1192,7 @@ impl<'a, 'h> Run<'a, 'h> {
                 let v = if p == Prop::MouseX { (m[3] * x - m[2] * y) / det } else { (m[0] * y - m[1] * x) / det };
                 num(fround_short(v))
             }
-            Prop::Text | Prop::Length => Err("not a text field".into()),
+            Prop::Text | Prop::Length | Prop::HtmlText | Prop::MaxChars | Prop::Restrict => Err("not a text field".into()),
             Prop::CurrentFrame | Prop::TotalFrames | Prop::CurrentLabel => {
                 if n.kind != NodeKind::MovieClip {
                     return Err(format!("“{}” is {}; only movie clips and the main timeline have frames", n.name, kind_name(n.kind)));
@@ -1171,10 +1237,13 @@ impl<'a, 'h> Run<'a, 'h> {
         let Some(node) = self.nodes.get(i) else { return };
         let ok = match event {
             ListenEvent::EnterFrame => node.kind != NodeKind::Graphic,
+            ListenEvent::Change => node.kind == NodeKind::Text,
             _ => matches!(node.kind, NodeKind::Button | NodeKind::MovieClip),
         };
         if !ok {
-            let why = if node.kind == NodeKind::Root { "the main timeline doesn't get pointer events here".to_string() } else { format!("“{}” is {}; only buttons and movie clips get pointer events", node.name, kind_name(node.kind)) };
+            let why = if event == ListenEvent::Change {
+                format!("“{}” is {}; only text fields send change events", node.name, kind_name(node.kind))
+            } else if node.kind == NodeKind::Root { "the main timeline doesn't get pointer events here".to_string() } else { format!("“{}” is {}; only buttons and movie clips get pointer events", node.name, kind_name(node.kind)) };
             return self.out(format!("{what}: {why}"));
         }
         let (path, name) = (node.path.clone(), node.name.clone());
@@ -1440,7 +1509,7 @@ impl<'a, 'h> Run<'a, 'h> {
         let Some(f) = t.field.as_ref() else { return };
         let st = self.st.fields.entry(path.to_vec()).or_default();
         let shown = f.shown(st.value(&t));
-        st.look = self.host.lay_out_field(&t, &shown).map(Arc::new);
+        st.look = self.host.lay_out_field(&t, &shown, st.rich.as_deref()).map(Arc::new);
         let len = chars(st.value(&t));
         st.caret = st.caret.min(len);
         st.anchor = st.anchor.min(len);
@@ -1451,8 +1520,53 @@ impl<'a, 'h> Run<'a, 'h> {
     fn set_field_text(&mut self, path: &[ElementId], text: &str) {
         let Some((t, _)) = self.field_node(path) else { return };
         let Some(f) = t.field.as_ref() else { return };
-        self.st.fields.entry(path.to_vec()).or_default().text = Some(fit(f, text));
+        let st = self.st.fields.entry(path.to_vec()).or_default();
+        st.text = Some(fit(f, text));
+        // Plain text is in the field's own style, as ActionScript's `text` is.
+        st.rich = None;
         self.relayout(path);
+    }
+
+    /// A script sets another member of field `path` (ADR 0107): `htmlText` (read into text and
+    /// styles, sanitised), `maxChars` or `restrict`.
+    fn set_field_member(&mut self, path: &[ElementId], p: Prop, v: &Value) {
+        let Some((t, _)) = self.field_node(path) else { return };
+        let st = self.st.fields.entry(path.to_vec()).or_default();
+        match p {
+            Prop::HtmlText => {
+                let parsed = html_text::parse(&v.text(), &t.char_style(), &t.para_style());
+                st.text = Some(parsed.text);
+                st.rich = Some(Arc::new(parsed.styles));
+                self.relayout(path);
+            }
+            Prop::MaxChars => st.max_chars = Some((v.number().clamp(0.0, crate::MAX_FIELD_CHARS as f64)) as u32),
+            Prop::Restrict => st.restrict = (!matches!(v, Value::Null | Value::Undefined)).then(|| v.text().chars().take(1024).collect()),
+            _ => {}
+        }
+    }
+
+    /// The viewer changed field `path`'s text (ADR 0107): its change actions run in the
+    /// timeline it is on, then the listeners scripts added for `Event.CHANGE`, in the order
+    /// added. Once per edit; text a script sets fires nothing, as in ActionScript.
+    fn changed(&mut self, path: &[ElementId]) {
+        self.refresh();
+        let Some(n) = self.index_of(path).and_then(|i| self.nodes.get(i)) else { return };
+        let actions = n.field().map(|(_, f)| f.on_change.clone()).filter(|a| !a.is_empty());
+        let owner_path = self.nodes.get(n.owner).map(|o| o.path.clone());
+        let listeners: Vec<Listening> = self.st.listeners.get(path).map(|l| l.iter().filter(|l| l.event == ListenEvent::Change).cloned().collect()).unwrap_or_default();
+        if actions.is_none() && listeners.is_empty() {
+            return;
+        }
+        if let (Some(actions), Some(owner)) = (actions, owner_path) {
+            self.run_list(&owner, &actions, false);
+        }
+        for l in listeners {
+            if self.halted {
+                return;
+            }
+            self.call_listener(&l, EventInfo { key: None, target: Some(path.to_vec()), current: Some(path.to_vec()) });
+        }
+        self.settle();
     }
 
     /// Runs an edit on the focused field (laying it out first if it never was).
@@ -1468,6 +1582,7 @@ impl<'a, 'h> Run<'a, 'h> {
         let changed = go(&mut Editor { block: &t, field: &f, st }, look.as_deref());
         if changed.text {
             self.relayout(&path);
+            self.changed(&path);
         } else if changed.caret {
             scroll_to_caret(&t, &f, self.st.fields.entry(path).or_default());
         }
@@ -1515,7 +1630,8 @@ impl<'a, 'h> Run<'a, 'h> {
         if let Some(p) = p {
             self.st.mouse = p;
         }
-        let now = p.and_then(|p| hit_in(self.doc, &self.st, &self.nodes, p));
+        let now = p.and_then(|p| hit_in(self.doc, &self.st, &self.nodes, p, &self.work));
+        self.overworked();
         if now != self.st.hover {
             let before = self.pointer_now();
             let old = std::mem::replace(&mut self.st.hover, now.clone());
@@ -1740,6 +1856,21 @@ impl World for Script<'_, '_, '_> {
         }
         let path = n.path.clone();
         self.r.set_field_text(&path, &text);
+        Ok(())
+    }
+
+    fn set_field(&mut self, at: &Place, p: Prop, v: Value) -> Result<(), Option<String>> {
+        if !self.r.budget() {
+            return Err(None);
+        }
+        let from = self.from().map_err(Some)?;
+        let i = self.r.place(from, self.ev.as_ref(), at).map_err(Some)?;
+        let Some(n) = i.and_then(|i| self.r.nodes.get(i)) else { return Err(Some("the stage isn't a text field".into())) };
+        if n.field().is_none() {
+            return Err(Some(format!("“{}” is {}, not a text field", n.name, kind_name(n.kind))));
+        }
+        let path = n.path.clone();
+        self.r.set_field_member(&path, p, &v);
         Ok(())
     }
 

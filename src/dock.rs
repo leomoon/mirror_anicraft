@@ -56,6 +56,30 @@ impl Panel {
         }
     }
 
+    /// The action that opens and closes it from the keyboard (#456): bindable in the shortcut
+    /// editor, shown beside its Window menu item.
+    pub fn action(self) -> &'static str {
+        match self {
+            Panel::Properties => "view.panel.properties",
+            Panel::Align => "view.panel.align",
+            Panel::Colour => "view.panel.colour",
+            Panel::Library => "view.panel.library",
+            Panel::MovieExplorer => "view.movie_explorer",
+            Panel::History => "view.panel.history",
+            Panel::LayerDepth => "view.panel.layer_depth",
+            Panel::Timeline => "view.panel.timeline",
+            Panel::MotionEditor => "view.panel.motion_editor",
+            Panel::Actions => "view.actions",
+            Panel::Output => "view.panel.output",
+            Panel::Swatches => "view.panel.swatches",
+            Panel::Tools => "view.panel.tools",
+        }
+    }
+
+    pub fn from_action(id: &str) -> Option<Panel> {
+        Panel::ALL.into_iter().find(|p| p.action() == id)
+    }
+
     pub fn from_id(id: &str) -> Option<Panel> {
         Panel::ALL.into_iter().find(|p| p.id() == id)
     }
@@ -716,7 +740,7 @@ pub fn built_in(key: &str) -> Option<Layout> {
         // Today's layout: Properties, Align, Library with the Movie Explorer, History on the
         // right; the timeline and the Motion Editor below the stage.
         "essentials" => Layout {
-            right: zone(vec![Group::of(&[Panel::Properties], 6.4), Group::of(&[Panel::Align], 1.3), Group::of(&[Panel::Library, Panel::MovieExplorer], 3.2), Group::of(&[Panel::History], 1.4)], None),
+            right: zone(vec![Group::of(&[Panel::Properties], 5.8), Group::of(&[Panel::Align], 1.9), Group::of(&[Panel::Library, Panel::MovieExplorer], 3.2), Group::of(&[Panel::History], 1.4)], None),
             bottom: zone(vec![Group::of(&[Panel::Timeline, Panel::MotionEditor], 1.0)], None),
             ..Layout::default()
         },

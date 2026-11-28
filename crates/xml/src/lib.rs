@@ -5,6 +5,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use std::collections::HashMap;
+use std::borrow::Cow;
 
 /// Largest document read (bytes).
 pub const MAX_INPUT: usize = 256 * 1024 * 1024;
@@ -18,6 +19,26 @@ pub struct Element {
     pub children: Vec<Element>,
     /// The element's direct character data with references resolved.
     pub text: String,
+}
+
+impl craft_xfl::shape::XflElement for Element {
+    type Elements<'a> = std::slice::Iter<'a, Element>;
+
+    fn local_name(&self) -> &str {
+        self.name.rsplit(':').next().unwrap_or(&self.name)
+    }
+
+    fn attr(&self, name: &str) -> Option<&str> {
+        Element::attr(self, name)
+    }
+
+    fn elements(&self) -> Self::Elements<'_> {
+        self.children.iter()
+    }
+
+    fn text_content(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.text)
+    }
 }
 
 impl Element {
@@ -79,7 +100,9 @@ fn options() -> craft_xml::Options<'static> {
     }
 }
 
-fn map_error(error: craft_xml::Error) -> XmlError {
+/// Keeps AniCraft's historical diagnostics when a shared parser entry point returns a
+/// `craft-xml` error directly.
+pub fn from_craft_error(error: craft_xml::Error) -> XmlError {
     match error {
         craft_xml::Error::TooLarge(_) => XmlError::TooLarge,
         craft_xml::Error::TooDeep(_) => XmlError::TooDeep,
@@ -140,16 +163,72 @@ fn convert(source: &craft_xml::El, mixed: &[&str], used: &mut usize) -> Result<E
     Ok(element)
 }
 
+fn convert_owned(source: craft_xml::El, mixed: &[&str], used: &mut usize) -> Result<Element, XmlError> {
+    use craft_xml::Node;
+
+    charge_item(used)?;
+    let craft_xml::El { name, attrs, children } = source;
+    let is_mixed = mixed.contains(&local(&name));
+    let has_elements = children.iter().any(|node| matches!(node, Node::El(_)));
+    let mut element = Element { name, ..Element::default() };
+    for (name, value) in attrs {
+        element.attrs.insert(name, value);
+    }
+    for node in children {
+        match node {
+            Node::El(child) => element.children.push(convert_owned(child, mixed, used)?),
+            Node::Text(text) | Node::CData(text) => {
+                element.text.push_str(&text);
+                if is_mixed {
+                    charge_item(used)?;
+                    element.children.push(text_node(&text));
+                }
+            }
+            Node::Pi { .. } | Node::Comment(_) => {}
+        }
+    }
+    if !is_mixed && has_elements && element.text.trim().is_empty() {
+        element.text.clear();
+    }
+    Ok(element)
+}
+
+/// Converts the shared XML tree into AniCraft's compatibility tree without reparsing bytes.
+pub fn from_craft_xml(source: &craft_xml::El) -> Result<Element, XmlError> {
+    let mut used = 0;
+    convert(source, &[], &mut used)
+}
+
+/// Converts and consumes the shared XML tree without retaining a second copy during conversion.
+pub fn from_craft_xml_owned(source: craft_xml::El) -> Result<Element, XmlError> {
+    let mut used = 0;
+    convert_owned(source, &[], &mut used)
+}
+
+fn normalize_element_names(element: &mut Element) {
+    element.name = local(&element.name).to_string();
+    for child in &mut element.children {
+        normalize_element_names(child);
+    }
+}
+
+/// Converts an owned shared XML tree and drops element-name prefixes for formats whose
+/// vocabulary is defined by local element names, such as XFL. Attribute names are preserved.
+pub fn from_craft_xml_owned_local_names(source: craft_xml::El) -> Result<Element, XmlError> {
+    let mut element = from_craft_xml_owned(source)?;
+    normalize_element_names(&mut element);
+    Ok(element)
+}
+
 /// Parses a document and returns its root element.
 pub fn parse(src: &[u8]) -> Result<Element, XmlError> {
-    let root = options().parse(src).map_err(map_error)?;
-    let mut used = 0;
-    convert(&root, &[], &mut used)
+    let root = options().parse(src).map_err(from_craft_error)?;
+    from_craft_xml(&root)
 }
 
 /// Parses a document whose `mixed` elements keep character stretches among their children.
 pub fn parse_mixed(src: &[u8], mixed: &[&str]) -> Result<Element, XmlError> {
-    let root = options().parse(src).map_err(map_error)?;
+    let root = options().parse(src).map_err(from_craft_error)?;
     let mut used = 0;
     convert(&root, mixed, &mut used)
 }
@@ -165,6 +244,13 @@ mod tests {
         assert_eq!(root.text, "&bad;&amp c");
     }
 
+    /// A numeric character reference is digits only (XML 1.0 §4.1): a sign makes it text.
+    #[test]
+    fn numeric_references_with_a_sign_stay_text() {
+        let root = parse(b"<a>a&#+65;b&#x+41;c&#-65;d&#65;&#x41;e</a>").unwrap();
+        assert_eq!(root.text, "a&#+65;b&#x+41;c&#-65;dAAe");
+    }
+
     #[test]
     fn mixed_text_stays_ordered_and_plain_indentation_stays_dropped() {
         let root = parse_mixed(b"<svg><text>Hello <tspan>big</tspan> world&amp;<!-- c --> more</text><g>\n  <path/>\n</g></svg>", &["text", "tspan"])
@@ -173,6 +259,17 @@ mod tests {
         let parts: Vec<(&str, &str)> = text.children.iter().map(|child| (child.name.as_str(), child.text.as_str())).collect();
         assert_eq!(parts, [(TEXT_NODE, "Hello "), ("tspan", "big"), (TEXT_NODE, " world& more")]);
         assert_eq!(root.children[1].text, "");
+    }
+
+    #[test]
+    fn xfl_compatibility_conversion_uses_element_local_names_and_preserves_attributes() {
+        let root = craft_xml::Options::default()
+            .parse(b"<x:DOMDocument xmlns:x='urn:xfl' x:version='1'><x:timelines><x:DOMTimeline/></x:timelines></x:DOMDocument>")
+            .unwrap();
+        let root = from_craft_xml_owned_local_names(root).unwrap();
+        assert_eq!(root.name, "DOMDocument");
+        assert_eq!(root.attr("x:version"), Some("1"));
+        assert_eq!(root.list("timelines")[0].name, "DOMTimeline");
     }
 
     #[test]

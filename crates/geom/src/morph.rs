@@ -18,6 +18,7 @@
 //! is kept), as are hints whose subpaths are already paired another way.
 
 use crate::{Path, PathCmd, Vec2};
+use std::collections::{HashMap, VecDeque};
 
 /// A cubic segment: control points and end point (the start is the previous end).
 type Seg = [Vec2; 3];
@@ -640,6 +641,151 @@ pub fn compatible_hinted(a: &Path, b: &Path, hints: &[(Vec2, Vec2)]) -> Option<(
     Some((to_path(&sa), to_path(&sb)))
 }
 
+/// Joins open subpaths that meet end to end (within `tol`) into longer runs, reversing pieces
+/// as needed, and closes the runs that come back to their start. The separate stroke runs of
+/// a raw shape's outline then morph as one outline, the way its fill does.
+///
+/// The work is bounded: each lookup visits at most [`CHAIN_SCAN`] runs per nearby grid cell, so
+/// the cost grows linearly with the number of runs however they are spread. In a cell crowded
+/// beyond that, a join may be missed (the runs stay separate, which is still a valid outline).
+pub fn chain(p: &Path, tol: f32) -> Path {
+    chain_counted(p, tol).0
+}
+
+/// Runs examined per grid cell by one [`chain`] lookup.
+const CHAIN_SCAN: usize = 16;
+
+fn sub_end(s: &Sub) -> Vec2 {
+    s.segs.last().map_or(s.start, |g| g[2])
+}
+
+/// The last remaining run with an end within `tol` of `at`, scanning at most [`CHAIN_SCAN`]
+/// entries per cell (taken runs at the back of a list are dropped as they are met). `steps`
+/// counts the entries looked at.
+fn chain_find(grid: &mut HashMap<(i64, i64), Vec<usize>>, slots: &[Option<Sub>], at: Vec2, tol: f32, cell: f32, steps: &mut usize) -> Option<usize> {
+    let key = |v: Vec2| ((v.x / cell).floor() as i64, (v.y / cell).floor() as i64);
+    let (kx, ky) = key(at);
+    let mut best: Option<usize> = None;
+    for dx in -1..=1_i64 {
+        for dy in -1..=1_i64 {
+            let Some(list) = grid.get_mut(&(kx.saturating_add(dx), ky.saturating_add(dy))) else { continue };
+            let mut seen = 0;
+            let mut k = list.len();
+            while k > 0 && seen < CHAIN_SCAN {
+                k -= 1;
+                *steps += 1;
+                seen += 1;
+                let Some(&i) = list.get(k) else { break };
+                let Some(s) = slots.get(i).and_then(Option::as_ref) else {
+                    if k + 1 == list.len() {
+                        list.pop();
+                    }
+                    continue;
+                };
+                if best.is_some_and(|b| b >= i) {
+                    break;
+                }
+                if s.start.distance(at) <= tol || sub_end(s).distance(at) <= tol {
+                    best = Some(i);
+                    break;
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Whether exactly two run ends of `ends` lie within `tol` of `at`: a plain corner, where the
+/// line can only go on one way. Where three or more meet (a crossing, a spur), which run
+/// continues the line is a guess, so [`chain`] joins nothing there. A cell crowded beyond
+/// [`CHAIN_SCAN`] ends counts as a junction.
+fn plain_corner(ends: &HashMap<(i64, i64), Vec<Vec2>>, at: Vec2, tol: f32, cell: f32, steps: &mut usize) -> bool {
+    let key = |v: Vec2| ((v.x / cell).floor() as i64, (v.y / cell).floor() as i64);
+    let (kx, ky) = key(at);
+    let mut n = 0;
+    for dx in -1..=1_i64 {
+        for dy in -1..=1_i64 {
+            let Some(list) = ends.get(&(kx.saturating_add(dx), ky.saturating_add(dy))) else { continue };
+            if list.len() > CHAIN_SCAN {
+                return false;
+            }
+            *steps += list.len();
+            n += list.iter().filter(|e| e.distance(at) <= tol).count();
+        }
+    }
+    n == 2
+}
+
+/// [`chain`], and the work it took: endpoint lookup steps plus segments moved.
+pub fn chain_counted(p: &Path, tol: f32) -> (Path, usize) {
+    let (mut out, mut open): (Vec<Sub>, Vec<Sub>) = subpaths(p).into_iter().partition(|s| s.closed);
+    open.reverse(); // popped in drawing order
+    let end = sub_end;
+    // Endpoints are looked up through a hashed grid of cell size `tol`.
+    let cell = if tol.is_finite() && tol > 0.0 { tol } else { 1.0 };
+    let key = |v: Vec2| ((v.x / cell).floor() as i64, (v.y / cell).floor() as i64);
+    let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    let mut ends: HashMap<(i64, i64), Vec<Vec2>> = HashMap::new();
+    for (i, s) in open.iter().enumerate() {
+        let (a, b) = (key(s.start), key(end(s)));
+        grid.entry(a).or_default().push(i);
+        if b != a {
+            grid.entry(b).or_default().push(i);
+        }
+        ends.entry(a).or_default().push(s.start);
+        ends.entry(b).or_default().push(end(s));
+    }
+    let mut slots: Vec<Option<Sub>> = open.into_iter().map(Some).collect();
+    let mut steps = 0;
+    while let Some(mut cur) = slots.iter_mut().rev().find_map(Option::take) {
+        while matches!(slots.last(), Some(None)) {
+            slots.pop();
+            steps += 1;
+        }
+        // The run grows at both ends in a deque, so a prepended piece costs its own length
+        // and never moves the segments already gathered.
+        let mut segs: VecDeque<Seg> = VecDeque::from(std::mem::take(&mut cur.segs));
+        steps += segs.len();
+        loop {
+            let tail = segs.back().map_or(cur.start, |g| g[2]);
+            // Back at its start: the outline is closed, whatever else touches it there.
+            if segs.len() > 1 && tail.distance(cur.start) <= tol {
+                break;
+            }
+            if plain_corner(&ends, tail, tol, cell, &mut steps)
+                && let Some(next) = chain_find(&mut grid, &slots, tail, tol, cell, &mut steps).and_then(|j| slots.get_mut(j)?.take())
+            {
+                let next = if next.start.distance(tail) <= tol { next } else { reverse(&next) };
+                steps += next.segs.len();
+                segs.extend(next.segs);
+                continue;
+            }
+            if plain_corner(&ends, cur.start, tol, cell, &mut steps)
+                && let Some(prev) = chain_find(&mut grid, &slots, cur.start, tol, cell, &mut steps).and_then(|j| slots.get_mut(j)?.take())
+            {
+                let prev = if end(&prev).distance(cur.start) <= tol { prev } else { reverse(&prev) };
+                steps += prev.segs.len();
+                for g in prev.segs.into_iter().rev() {
+                    segs.push_front(g);
+                }
+                cur.start = prev.start;
+                continue;
+            }
+            break;
+        }
+        cur.segs = Vec::from(segs);
+        steps += cur.segs.len();
+        if cur.segs.len() > 1 && end(&cur).distance(cur.start) <= tol {
+            if let Some(g) = cur.segs.last_mut() {
+                g[2] = cur.start;
+            }
+            cur.closed = true;
+        }
+        out.push(cur);
+    }
+    (to_path(&out), steps)
+}
+
 /// The shape `t` of the way from `a` to `b` (0 = `a`, 1 = `b`), for any two paths.
 ///
 /// Always goes through [`compatible`]: two paths with the same commands can still start at
@@ -842,6 +988,68 @@ mod tests {
     }
 
     #[test]
+    fn chain_joins_pieces_that_meet_into_outlines() {
+        // A triangle's sides, out of order, one drawn backwards and one a hair off its corner,
+        // plus a stray line and a closed square: the sides become one closed outline.
+        let (p, q, r) = (Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), Vec2::new(5.0, 8.0));
+        let sides = [Path::line(q, r), Path::line(Vec2::new(0.05, 0.0), q), Path::line(p, r)];
+        let stray = Path::line(Vec2::new(50.0, 50.0), Vec2::new(60.0, 50.0));
+        let square = Path::rect(100.0, 0.0, 5.0, 5.0);
+        let all = Path { cmds: sides.iter().chain([&stray, &square]).flat_map(|p| p.cmds.clone()).collect() };
+        let joined = chain(&all, 0.2);
+        let subs = subpaths(&joined);
+        assert_eq!(subs.len(), 3, "{subs:?}");
+        let tri = subs.iter().find(|s| s.segs.len() == 3).unwrap();
+        assert!(tri.closed);
+        let corners: Vec<Vec2> = anchors(tri).collect();
+        for c in [q, r] {
+            assert!(corners.iter().any(|a| close(*a, c)), "{c:?} in {corners:?}");
+        }
+        assert!(corners.iter().any(|a| a.distance(p) < 0.1));
+        assert!(subs.iter().any(|s| !s.closed && s.segs.len() == 1), "the stray line stays open");
+        assert!(subs.iter().any(|s| s.closed && s.segs.len() == 4), "the square passes through");
+        // The joined triangle morphs like the filled one.
+        assert!(morph(&joined, &Path::ellipse(0.0, 0.0, 5.0, 5.0), 0.5).is_some());
+        assert!(chain(&Path::default(), 0.2).cmds.is_empty());
+    }
+
+    #[test]
+    fn chain_leaves_a_junction_of_three_or_more_runs_unjoined() {
+        // A square ABCD with a diagonal BD of the same style, in the order AB, BD, BC, CD, DA.
+        // Three runs meet at B and at D: which one continues the line there is a guess, and a
+        // wrong guess (AB → BD) folds the square's sides into an open zigzag. Nothing is joined
+        // through B or D; the corners where just two runs meet (A, C) still join.
+        let (a, b, c, d) = (Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), Vec2::new(10.0, 10.0), Vec2::new(0.0, 10.0));
+        let runs = [(a, b), (b, d), (b, c), (c, d), (d, a)];
+        let mut p = Path::default();
+        for (s, e) in runs {
+            p.move_to(s).line_to(e);
+        }
+        let subs = subpaths(&chain(&p, 0.01));
+        assert_eq!(subs.iter().map(|s| s.segs.len()).sum::<usize>(), 5, "no segment is lost");
+        // DA + AB, BC + CD, and the diagonal alone.
+        let mut lens: Vec<usize> = subs.iter().map(|s| s.segs.len()).collect();
+        lens.sort_unstable();
+        assert_eq!(lens, [1, 2, 2], "{subs:?}");
+        for s in &subs {
+            let pts: Vec<Vec2> = anchors(s).collect();
+            // No run passes through B or D: they are only ever an end.
+            for q in pts.iter().skip(1).take(pts.len().saturating_sub(2)) {
+                assert!(!close(*q, b) && !close(*q, d), "joined through a junction: {pts:?}");
+            }
+        }
+        // A triangle with a spur at A: the triangle still closes, the spur stays apart.
+        let mut p = Path::default();
+        for (s, e) in [(a, b), (b, c), (c, a), (a, d)] {
+            p.move_to(s).line_to(e);
+        }
+        let subs = subpaths(&chain(&p, 0.01));
+        assert_eq!(subs.len(), 2, "{subs:?}");
+        assert!(subs.iter().any(|s| s.closed && s.segs.len() == 3), "the triangle closes: {subs:?}");
+        assert!(subs.iter().any(|s| !s.closed && s.segs.len() == 1), "the spur stays apart: {subs:?}");
+    }
+
+    #[test]
     fn nearest_point_snaps_to_the_outline() {
         let sq = Path::rect(0.0, 0.0, 100.0, 100.0);
         let (q, d) = nearest_point(&sq, Vec2::new(50.0, 40.0)).unwrap();
@@ -869,5 +1077,64 @@ mod tests {
         let r = morph(&small, &big, 0.5);
         assert!(r.is_none() || r.is_some_and(|p| p.cmds.iter().all(|c| !matches!(c, PathCmd::LineTo(_)))));
         assert!(t0.elapsed().as_secs_f32() < 2.0, "{:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn chaining_many_disconnected_runs_stays_cheap_and_correct() {
+        // Many separate open runs, with one chain of three pieces among them (the middle one
+        // drawn backwards): a scan per run would be quadratic.
+        let n = 100_000;
+        let mut p = Path::default();
+        for i in 0..n {
+            let x = i as f32 * 10.0;
+            p.move_to(Vec2::new(x, 0.0)).line_to(Vec2::new(x + 1.0, 0.0));
+        }
+        p.move_to(Vec2::new(0.0, 5.0)).line_to(Vec2::new(1.0, 5.0));
+        p.move_to(Vec2::new(2.0, 5.0)).line_to(Vec2::new(1.0, 5.0));
+        p.move_to(Vec2::new(2.0, 5.0)).line_to(Vec2::new(3.0, 5.0));
+        let (c, steps) = chain_counted(&p, 0.01);
+        assert!(steps <= 100 * n, "{steps} steps");
+        let subs = subpaths(&c);
+        assert_eq!(subs.len(), n + 1);
+        assert_eq!(subs.iter().filter(|s| s.segs.len() == 3).count(), 1);
+        assert!(subs.iter().all(|s| !s.closed));
+    }
+
+    #[test]
+    fn chaining_runs_crowded_into_one_cell_stays_bounded() {
+        // Every run starts and ends inside one cell of a large tolerance, and none touches
+        // another run's end exactly: lookups would each scan the whole cell.
+        let n = 20_000;
+        let mut p = Path::default();
+        for i in 0..n {
+            let y = i as f32 * 1e-4;
+            p.move_to(Vec2::new(0.0, y)).line_to(Vec2::new(0.5, y));
+        }
+        let (c, steps) = chain_counted(&p, 1000.0);
+        assert!(steps <= 200 * n, "{steps} steps");
+        let subs = subpaths(&c);
+        // No segment is lost, whichever joins were made.
+        assert_eq!(subs.iter().map(|s| s.segs.len()).sum::<usize>(), n);
+    }
+
+    #[test]
+    fn chaining_a_long_chain_does_not_rescan_taken_runs() {
+        // A long chain taken run by run, then many disconnected runs looked up after it: runs
+        // already taken must not be rescanned by every later lookup.
+        let n = 20_000;
+        let mut p = Path::default();
+        for i in 0..n {
+            let x = i as f32;
+            p.move_to(Vec2::new(x, 0.0)).line_to(Vec2::new(x + 1.0, 0.0));
+        }
+        for i in 0..n {
+            let y = 10.0 + i as f32 * 5.0;
+            p.move_to(Vec2::new(-100.0, y)).line_to(Vec2::new(-99.0, y));
+        }
+        let (c, steps) = chain_counted(&p, 0.01);
+        assert!(steps <= 200 * n, "{steps} steps");
+        let subs = subpaths(&c);
+        assert_eq!(subs.len(), n + 1);
+        assert_eq!(subs.iter().filter(|s| s.segs.len() == n).count(), 1);
     }
 }

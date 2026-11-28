@@ -6,7 +6,7 @@ onion skin and Edit Multiple Frames.
 
 A note on keys: AniCraft uses **Ctrl** on Windows and Linux and **⌘** (Command) on macOS, and
 **Alt** is **⌥** (Option) on macOS. So **Ctrl+Alt+C** is **⌥⌘C** on a Mac. Every shortcut
-here is a default you can change in the shortcut editor (**F1**); see
+here is a default you can change in the shortcut editor (**Ctrl+Alt+Shift+K**); see
 [Preferences, shortcuts and accessibility](preferences-shortcuts-accessibility.md).
 
 ## A tour of the timeline
@@ -18,7 +18,9 @@ The timeline sits under the stage. From left to right, its header holds:
   Loop playback;
 * the onion skin buttons and their options menu;
 * the camera button;
-* the current frame number, the frame rate and the time at the playhead;
+* the current frame number and the frame rate, which are fields (click the frame number and
+  type a frame to go there, or drag it to scrub; a number past the end goes to the last
+  frame), and the time at the playhead;
 * the **Insert frame**, **Insert keyframe** and **Insert blank keyframe** buttons (a frame, a
   filled dot and a hollow dot, each with a plus), and a tween menu.
 
@@ -37,12 +39,33 @@ wheel.
   Layer**. It goes above the active layer.
 * **Delete a layer**: select it and click the delete button under the list, or choose
   **Modify › Timeline › Delete Layer**. Undo brings it back.
-* **Reorder layers**: use the up and down buttons under the list, or **Modify › Timeline › Move
+* **Reorder layers**: drag a layer by its name to where you want it. A line shows where it
+  will land; **Esc** cancels the drag. A folder, a mask or a guide moves with everything in it.
+  From the keyboard, use the up and down buttons under the list, or **Modify › Timeline › Move
   Layer Up** and **Move Layer Down**.
 * **Rename a layer**: double-click its name, or right-click it and choose **Rename Layer**.
 
 Clicking a layer's name makes it the active layer and selects its artwork, as you'd expect from
 Animate. Right-click a layer for a menu with nearly everything in this section.
+
+### Selecting several layers
+
+* **Ctrl**-click a layer's name to add it to the selected layers, or to take it out again.
+* **Shift**-click a name to select every layer from the active one to it. With the timeline
+  focused, **Shift+Up** and **Shift+Down** do the same one layer at a time.
+* Click a name without a key to go back to one layer.
+
+The selected layers are highlighted. Together they can be:
+
+* **moved**: drag any one of them by its name and they all go, landing together in the order
+  they had. Drop them on a folder to put them all inside;
+* **put in a new folder**: click the folder button under the list (or **Insert › Timeline › New
+  Folder**). The folder appears where the top one was, with the selected layers in it;
+* **deleted**: the delete button and **Modify › Timeline › Delete Layer** take them all, after
+  asking once if they hold artwork.
+
+Each of these is one undo step. The eye, the padlock and the other buttons on a row still act
+on that row alone, and the up and down buttons move the active layer.
 
 ### Show, lock and outline
 
@@ -55,6 +78,21 @@ Each layer row has three toggles:
 
 Outlines are a working aid only. They show on the stage, but Test Movie and every export draw
 the artwork as it really is.
+
+The eye, the padlock and the square **above the layer names** act on every layer at once, as in
+Animate: one click hides, locks or outlines them all, and the next click brings them all back.
+When only some layers are hidden (or locked, or outlined), the first click makes them all alike.
+The camera layer is left alone.
+
+To work on one layer without the others' rows in the way, click the **View only the active
+layer** button beside the **Layers** heading (the one after the parenting view's): the timeline
+shows the active layer's row alone, following you as you pick another layer (with the arrow
+keys or the stage). The other layers stay on the stage, and their settings are untouched.
+Click the button again to see every row.
+
+To give the frames more room, drag the line between the layer names and the frames to the left
+(or to the right for long layer names). Double-click the line to put it back. AniCraft remembers
+the width.
 
 ### Layer colours
 
@@ -72,8 +110,22 @@ row taller. This is handy for layers you work on a lot, or for seeing sound wave
 Double-click a layer's icon (or right-click it and choose **Properties…**, or choose **Modify ›
 Timeline › Layer Properties**) to open the Layer Properties window. Here you can set, all at
 once, the layer's name, whether it shows and is locked, its type (Normal, Mask, Masked, Guide
-or Guided), its outline colour, outlines, onion skin and height. **OK** applies everything as
-one undo step; **Cancel** changes nothing.
+or Guided), its outline colour, outlines, onion skin, opacity and height. **OK** applies
+everything as one undo step; **Cancel** changes nothing.
+
+### Layer opacity
+
+**Opacity** in Layer Properties sets how strongly a layer shows, from 0 to 100 %. For the usual
+values, right-click the layer and choose **Opacity** › **100 %**, **75 %**, **50 %**, **25 %**
+or **0 %**. A faded layer shows its percentage beside its name.
+
+The layer fades **as one**: its artwork is drawn together first, so where two of its shapes
+overlap you don't see one through the other. A folder's opacity fades every layer in it, on
+top of each layer's own. Mask and guide layers ignore it.
+
+Layer opacity is part of your movie: you see it on the stage, in Test Movie and in every
+export. (Animate's *Transparent* layer setting is only a view while you work; to see through
+a layer while tracing without changing the movie, use **View as Outlines** instead.)
 
 Layer Properties works on one layer at a time. Editing several layers at once isn't there yet.
 
@@ -82,14 +134,70 @@ Layer Properties works on one layer at a time. Editing several layers at once is
 Folders keep big timelines tidy.
 
 1. Click the folder button under the layer list, or choose **Insert › Timeline › New Folder**.
-   The folder appears above the active layer.
-2. Select a layer and use the up and down buttons to move it in under the folder. Moving a layer
-   off either end of the folder takes it out again.
+   The folder appears above the active layer. With
+   [several layers selected](#selecting-several-layers) they go straight into it.
+2. Drag a layer by its name onto the folder to put it inside, or between two layers of an open
+   folder. Drag it above or below a layer outside the folder to take it out again. (With the up
+   and down buttons: move a layer in under the folder, and off either end to take it out.)
 3. Click the folder's chevron to open or close it.
 
 Hiding or locking a folder hides or locks everything inside it. Folders can nest, and a folder
 moves with its contents. Deleting a folder deletes what's in it: AniCraft asks first, and undo
 brings it all back.
+
+### Layer parenting
+
+Layer parenting makes one layer follow another, the way Animate's does. Parent a forearm layer
+to an upper-arm layer and the forearm moves, turns and scales with the upper arm, while each
+layer keeps its own keyframes and tweens. It is the quick way to rig a cut-out character: a
+hand follows a forearm, the forearm follows the upper arm, a prop follows the hand. You don't
+need symbols inside symbols, or bones.
+
+**Open the parenting view.** Click the small tree button beside the **Layers** heading, or
+choose **View › Parenting View**. Each layer gets a dot in its colour in a new column.
+
+**Parent a layer.** Drag from the layer's dot to the layer it should follow. The row you can
+drop on lights up, and a line then joins the two dots. A layer that follows another steps in,
+so a chain reads like a tree. The layer stays exactly where it is on the stage: only what it
+follows changes. **Esc** cancels the drag.
+
+**Pick the parent from a menu.** Click a layer's dot for a menu of the layers it can follow,
+with **No Parent** at the top. The same menu is under **Parent** when you right-click a layer,
+whether the parenting view is open or not. From the keyboard, Tab to the dot and press
+**Enter** or **Space**.
+
+**Remove the parent.** Choose **No Parent** in that menu, or **Modify › Timeline › Remove
+Parent**. The layer again stays where it is on the stage.
+
+How it behaves:
+
+* The layer follows the **first (bottom-most) object** on its parent layer, at every frame:
+  its position, rotation, scale and skew. Keep one object on a layer that others follow.
+* It does **not** take the parent's colour effect, filters, blend mode, opacity or visibility.
+  Hiding the parent layer doesn't hide the layers that follow it.
+* Each layer still animates on its own. Tween the upper arm's rotation and the forearm swings
+  with it; tween the forearm's rotation too and the elbow bends while it swings. Draw each
+  part from its joint (or give a symbol instance a transformation point there) so it turns
+  about the joint.
+* You keep working on the stage as usual: move, rotate or scale a layer that follows another,
+  type its position in Properties, or draw on it, and it goes where you put it.
+* Parenting is one undo step. If the layer already has keyframes, all of them are adjusted
+  once so that the layer doesn't move at the current frame; on other frames it now goes where
+  its parent takes it.
+* A layer can't follow itself or a layer that follows it. Normal and mask layers can follow;
+  normal, mask and armature layers can be followed. Folders, guide layers and the camera
+  layer can't be either.
+* Deleting a parent layer leaves the layers that followed it where they are.
+* The camera, layer depth, masks and every export work as before: the movie shows what the
+  stage shows.
+
+A ready-made example for scripts, the CLI and the control port:
+`file.new_sample {"which": "arm"}` opens an arm of three parented layers
+(see [Working headless](working-headless.md)).
+
+Not there yet: changing a layer's parent part-way through the timeline, and **Edit Multiple
+Frames** and motion path editing on a layer that follows a turned parent (they work in the
+parent's space). Parenting in Animate files doesn't come across yet.
 
 ### Special layer types
 
@@ -120,12 +228,17 @@ As in Animate, the keys keep you moving along the timeline:
 * **F6** or **F7** on a frame that is already a keyframe adds the new keyframe on the *next*
   frame and moves there, so you can draw, press **F6**, draw again, and so on. On any other
   frame they key the frame you're on.
-* With no frames selected (for example after scrubbing the playhead), **F5** adds a frame on
-  every layer that has frames at or after the playhead, so the layers stay in step. Layers that
-  end before the playhead are left alone. When no layer reaches the playhead, it lengthens the
-  layer you're on up to it.
+* With no frames selected (for example after clicking the frame ruler or dragging the
+  playhead), **F5** adds a frame on every layer that has frames at or after the playhead, so
+  the layers stay in step. Layers that end before the playhead are left alone. When no layer
+  reaches the playhead, it lengthens the layer you're on up to it. **Shift+F5** and
+  **Shift+F6** act on every layer there too; **F6** and **F7** key the layer you're on.
 * With a frame selected, the keys act on that frame's layer, and the selection moves with the
   playhead.
+* With several frames selected, **F6** makes every one of them a keyframe of what it showed, and
+  **F7** makes every one a blank keyframe, on each selected layer: select a stretch of frames
+  and press **F7** to set up frame-by-frame drawing. Keyframes already in the range keep their
+  drawings.
 
 An empty frame shows a hint in **Properties › Frame**: press **F7** to start drawing there.
 
@@ -134,6 +247,9 @@ An empty frame shows a hint in **Properties › Frame**: press **F7** to start d
 * Click a frame to select it and move the playhead there.
 * **Shift**-click, or drag across frames, to select a range. A selection can span several
   layers.
+* Click the frame ruler, or drag the playhead, to deselect the frames, as in Animate: the
+  ruler isn't a frame of any one layer. **F5** then adds frames on every layer, until you
+  click a frame of one layer again.
 * **Ctrl+Alt+A** selects every frame.
 
 The frame keys, the header buttons and the right-click menu all act on the whole selection.
@@ -141,9 +257,11 @@ Removing or clearing frames that hold artwork asks first.
 
 ### Moving keyframes and resizing spans
 
-* **Move keyframes**: drag selected keyframes left or right in time, or up and down onto other
-  layers. An outline shows where they will land. Keys they land on are replaced, and the source
-  keeps empty frames, as in Animate.
+* **Move keyframes**: click a keyframe to select it (or select a range), then drag it left or
+  right in time, or up and down onto other layers, as in Animate. Over selected keyframes the
+  pointer is a hand, to show they can be dragged; an outline shows where they will land. Keys
+  they land on are replaced, and the source keeps empty frames. **Alt**-drag copies a tween
+  span. A drag that starts on a frame that isn't selected selects a range instead.
 * **Change a span's length**: drag the end of a span. The pointer turns into a resize cursor,
   and a label shows the length in frames and seconds. Later frames move with it.
 
@@ -183,9 +301,9 @@ To see the movie with its buttons and scripts working, use **Control › Test Mo
 
 ### Frame rate
 
-The header shows the frame rate. To change it, click an empty part of the stage so nothing is
-selected, then set **Properties › Document › Frame rate** (1 to 120 fps; fractional rates such
-as 29.97 work too).
+The header shows the frame rate. To change it, click it there and type a new one, or drag it
+(1 to 120 fps; fractional rates such as 29.97 work too). It is the same value as
+**Properties › Document › Frame rate**, which shows when nothing is selected.
 
 ### Zooming the frames
 
@@ -269,7 +387,7 @@ tween's object on several frames, and dragging the shared pivot.
 
 A movie can have several scenes, each with its own timeline, played one after another.
 
-* Add one with **Insert › Scene**.
+* Add one with **Insert › New Scene**.
 * Switch scenes from the scene menu at the top left of the stage, or with **Shift+Page Up** and
   **Shift+Page Down**.
 * Duplicate, rename, reorder and delete them under **Modify › Scene**. Deleting a scene with

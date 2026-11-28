@@ -11,7 +11,12 @@
 //! The store is per thread (the browser has one), bounded ([`MAX_MEMORY_BYTES`]), and tests can
 //! switch a thread to it on any platform with [`use_memory`]. So commands read and write files
 //! on their own thread, never from the rayon pool (render there, write after).
+//!
+//! Every function here first asks [`crate::access`] whether automation roots are in force on
+//! this thread (ADR 0124): an agent's commands read and write inside its roots only. A refused
+//! question ("is it there?") answers no; a refused read or write is an error naming the roots.
 
+use crate::access::{Access, check};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io;
@@ -103,6 +108,12 @@ impl MemFs {
         self.files.get(&key(path)?).map(|f| f.data.clone()).ok_or_else(|| not_found(path))
     }
 
+    /// The file's first `limit` bytes at most.
+    pub fn read_at_most(&self, path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+        let n = usize::try_from(limit).unwrap_or(usize::MAX);
+        self.files.get(&key(path)?).map(|f| f.data.iter().take(n).copied().collect()).ok_or_else(|| not_found(path))
+    }
+
     pub fn len(&self, path: &Path) -> io::Result<u64> {
         self.files.get(&key(path)?).map(|f| f.data.len() as u64).ok_or_else(|| not_found(path))
     }
@@ -191,10 +202,27 @@ pub fn take_written() -> Vec<(PathBuf, Vec<u8>)> {
 }
 
 pub fn read(path: &Path) -> io::Result<Vec<u8>> {
+    check(path, Access::Read)?;
     mem(|m| m.read(path)).unwrap_or_else(|| std::fs::read(path))
 }
 
+/// Reads at most `limit` bytes of the file, and one more when it holds them: a result
+/// longer than `limit` says the file is over it, without the rest being read.
+pub fn read_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    check(path, Access::Read)?;
+    let limit = limit.saturating_add(1);
+    match mem(|m| m.read_at_most(path, limit)) {
+        Some(r) => r,
+        None => {
+            let mut out = Vec::new();
+            io::Read::read_to_end(&mut io::Read::take(std::fs::File::open(path)?, limit), &mut out)?;
+            Ok(out)
+        }
+    }
+}
+
 pub fn read_to_string(path: &Path) -> io::Result<String> {
+    check(path, Access::Read)?;
     match mem(|m| m.read(path)) {
         Some(r) => String::from_utf8(r?).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the file is not UTF-8 text")),
         None => std::fs::read_to_string(path),
@@ -202,31 +230,76 @@ pub fn read_to_string(path: &Path) -> io::Result<String> {
 }
 
 pub fn write(path: &Path, data: impl AsRef<[u8]>) -> io::Result<()> {
+    check(path, Access::Write)?;
     match mem(|m| m.write(path, data.as_ref().to_vec())) {
         Some(r) => r,
         None => std::fs::write(path, data),
     }
 }
 
+/// Like [`write`], but the file must not exist yet (`O_EXCL`: a planted file or symlink makes it
+/// fail instead of being written through). For the temporary file a save writes and then
+/// renames over the document: its bytes are on the disk (`fsync`) before this returns, as the
+/// recovery copy's are (`recovery::write_atomic`). Without that a power cut soon after the
+/// rename can leave the new name on an empty file, with the old document already gone.
+pub fn write_new(path: &Path, data: impl AsRef<[u8]>) -> io::Result<()> {
+    check(path, Access::Write)?;
+    match mem(|m| m.write(path, data.as_ref().to_vec())) {
+        Some(r) => r,
+        None => std::fs::OpenOptions::new().write(true).create_new(true).open(path).and_then(|mut f| {
+            io::Write::write_all(&mut f, data.as_ref())?;
+            f.sync_all()
+        }),
+    }
+}
+
+/// 16 hex digits an outsider can't guess (the standard library's randomly seeded hasher), for
+/// temporary file names.
+pub fn random_suffix() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    format!("{:016x}", std::collections::hash_map::RandomState::new().build_hasher().finish())
+}
+
 /// The file's size in bytes (`std::fs::metadata(path)?.len()`).
 pub fn len(path: &Path) -> io::Result<u64> {
+    check(path, Access::Probe)?;
     mem(|m| m.len(path)).unwrap_or_else(|| std::fs::metadata(path).map(|m| m.len()))
 }
 
 pub fn exists(path: &Path) -> bool {
+    if check(path, Access::Probe).is_err() {
+        return false;
+    }
     mem(|m| m.is_file(path) || m.is_dir(path)).unwrap_or_else(|| path.exists())
 }
 
 pub fn is_file(path: &Path) -> bool {
+    if check(path, Access::Probe).is_err() {
+        return false;
+    }
     mem(|m| m.is_file(path)).unwrap_or_else(|| path.is_file())
 }
 
 pub fn is_dir(path: &Path) -> bool {
+    if check(path, Access::Probe).is_err() {
+        return false;
+    }
     mem(|m| m.is_dir(path)).unwrap_or_else(|| path.is_dir())
+}
+
+/// `path` with its `.` and `..` parts and links resolved (`std::fs::canonicalize`), for a path
+/// an agent may probe. In memory, and where it can't be resolved, `None`: the caller keeps the
+/// path it has.
+pub fn canonicalize(path: &Path) -> Option<PathBuf> {
+    if check(path, Access::Probe).is_err() || in_memory() {
+        return None;
+    }
+    std::fs::canonicalize(path).ok()
 }
 
 /// Folders in memory exist through their files, so this only checks the name there.
 pub fn create_dir_all(path: &Path) -> io::Result<()> {
+    check(path, Access::Write)?;
     match mem(|m| if m.is_file(path) { Err(unsupported("a file has that name")) } else { Ok(()) }) {
         Some(r) => r,
         None => std::fs::create_dir_all(path),
@@ -234,15 +307,21 @@ pub fn create_dir_all(path: &Path) -> io::Result<()> {
 }
 
 pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
+    check(from, Access::Write)?;
+    check(to, Access::Write)?;
     mem(|m| m.rename(from, to)).unwrap_or_else(|| std::fs::rename(from, to))
 }
 
 pub fn remove_file(path: &Path) -> io::Result<()> {
+    check(path, Access::Write)?;
     mem(|m| m.remove_file(path)).unwrap_or_else(|| std::fs::remove_file(path))
 }
 
 /// The entries of folder `dir`, at most `limit` (none if it can't be read).
 pub fn list(dir: &Path, limit: usize) -> Vec<PathBuf> {
+    if check(dir, Access::Read).is_err() {
+        return Vec::new();
+    }
     match mem(|m| m.list(dir, limit)) {
         Some(l) => l,
         None => std::fs::read_dir(dir).map(|rd| rd.take(limit).flatten().map(|e| e.path()).collect()).unwrap_or_default(),
@@ -258,11 +337,21 @@ pub enum Writer {
 
 impl Writer {
     pub fn create(path: &Path) -> io::Result<Writer> {
+        check(path, Access::Write)?;
         if in_memory() {
             key(path)?;
             return Ok(Writer::Memory(path.to_path_buf(), Vec::new()));
         }
         Ok(Writer::Disk(io::BufWriter::new(std::fs::File::create(path)?)))
+    }
+
+    /// Like [`Writer::create`], but the file must not exist yet.
+    pub fn create_new(path: &Path) -> io::Result<Writer> {
+        check(path, Access::Write)?;
+        if in_memory() {
+            return Writer::create(path);
+        }
+        Ok(Writer::Disk(io::BufWriter::new(std::fs::OpenOptions::new().write(true).create_new(true).open(path)?)))
     }
 
     pub fn finish(self) -> io::Result<()> {
@@ -300,6 +389,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn temp_files_are_created_exclusively() {
+        let dir = std::env::temp_dir().join(format!("anicraft-vfs-{}-{}", std::process::id(), random_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("t.tmp");
+        write_new(&f, b"a").unwrap();
+        assert_eq!(write_new(&f, b"b").unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(Writer::create_new(&f).err().map(|e| e.kind()), Some(io::ErrorKind::AlreadyExists));
+        assert_eq!(std::fs::read(&f).unwrap(), b"a");
+        assert_ne!(random_suffix(), random_suffix());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn paths_have_one_spelling_and_stay_inside() {
         assert_eq!(key(Path::new("/a/./b/../c.txt")).unwrap(), PathBuf::from("a").join("c.txt"));
         assert_eq!(key(Path::new("c.txt")).unwrap(), key(Path::new("./c.txt")).unwrap());
@@ -325,6 +427,23 @@ mod tests {
         let out = m.take_written();
         assert_eq!(out.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(), vec![PathBuf::from("out").join("frame_0001.png"), PathBuf::from("out").join("frame_0002.png")]);
         assert_eq!((m.bytes(), m.is_file(Path::new("in/walk.anicraft"))), (0, false), "emptied, the picked file too");
+    }
+
+    #[test]
+    fn bounded_reads_stop_one_byte_past_the_limit() {
+        let dir = std::env::temp_dir().join(format!("anicraft-vfs-{}-{}", std::process::id(), random_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("big.bin");
+        std::fs::write(&f, [7u8; 10]).unwrap();
+        assert_eq!(read_bounded(&f, 4).unwrap().len(), 5, "the extra byte says the file is over the limit");
+        assert_eq!(read_bounded(&f, 10).unwrap().len(), 10);
+        assert_eq!(read_bounded(&f, u64::MAX).unwrap().len(), 10);
+        std::fs::remove_dir_all(&dir).ok();
+        let mut m = MemFs::default();
+        m.put(Path::new("big.bin"), vec![7; 10]).unwrap();
+        assert_eq!(m.read_at_most(Path::new("big.bin"), 5).unwrap().len(), 5);
+        assert_eq!(m.read_at_most(Path::new("big.bin"), u64::MAX).unwrap().len(), 10);
+        assert_eq!(m.read_at_most(Path::new("nope"), 5).unwrap_err().kind(), io::ErrorKind::NotFound);
     }
 
     #[test]

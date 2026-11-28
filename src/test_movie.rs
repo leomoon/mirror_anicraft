@@ -45,7 +45,7 @@ const MAX_EDGE: f32 = 2048.0;
 
 /// The movie surface's id: while it has the focus, keys go to the movie.
 pub fn surface_id() -> egui::Id {
-    egui::Id::new("test_movie_surface")
+    egui::Id::unique("test_movie_surface")
 }
 
 /// Whether the movie has the keyboard.
@@ -341,6 +341,8 @@ fn own_window(app: &mut App, ctx: &egui::Context) -> Asked {
         builder = builder.with_position(at);
     }
     let builder = crate::platform::secondary_window(builder);
+    // The window's surface is set up and drawn inside the call (ADR 0105).
+    let _paused = crate::gpu_stage::paused();
     ctx.show_viewport_immediate(viewport_id(), builder, |ui, class| {
         let mut asked = Asked::default();
         let (close_requested, outer) = ui.input(|i| (i.viewport().close_requested(), i.viewport().outer_rect));
@@ -386,8 +388,8 @@ fn inside(app: &mut App, ctx: &egui::Context, why: crate::platform::Inside) -> A
     let default_h = default_w * sh / sw.max(1.0) + 190.0;
     let title = title(tm);
     let note = why.note().map(crate::i18n::t);
-    let win = egui::Window::new(title.clone())
-        .id(egui::Id::new("test_movie"))
+    let win = crate::windows::new(ctx, title.clone())
+        .id(egui::Id::unique("test_movie"))
         .open(&mut shown)
         .collapsible(false)
         .resizable(true)
@@ -861,7 +863,7 @@ mod tests {
         for _ in 0..2 {
             frame(&ctx, &mut app, vec![]);
         }
-        assert!(ctx.memory(|m| m.area_rect(egui::Id::new("test_movie")).is_some()), "the floating window");
+        assert!(ctx.memory(|m| m.area_rect(egui::Id::unique("test_movie")).is_some()), "the floating window");
         frame(&ctx, &mut app, vec![ctrl(egui::Key::W)]);
         assert!(app.test_movie.is_none());
     }

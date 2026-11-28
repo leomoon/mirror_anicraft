@@ -1,6 +1,6 @@
 [package]
 name = "anicraft-cli"
-description = "AniCraft L4: headless CLI and JSON-lines control channel for agents and pipelines"
+description = "AniCraft L4: headless CLI, MCP server and the desktop app's live control channel"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -20,9 +20,22 @@ anicraft-engine.workspace = true
 anicraft-render.workspace = true
 anicraft-geom.workspace = true
 anicraft-guide.workspace = true
+# The legacy Flash container, for `fla-dump` (ADR 0120).
+anicraft-fla.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
+clap.workspace = true
+
+# The live control port's per-run token (ADR 0104): the operating system's random numbers.
+# MIT OR Apache-2.0, already in the tree. Not for the web: a page has no sockets, so the control
+# port (and `mcp --bridge`) is left out of wasm32 builds.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+getrandom = "0.3"
 
 [dev-dependencies]
+# Man pages and shell completions, written by `examples/man-and-completions.rs` (RFC-0018 rule 1.9).
+clap_complete.workspace = true
+clap_mangen.workspace = true
 # Exporter plug-in fixtures written in WebAssembly text (Apache-2.0 WITH LLVM-exception).
 wat = "1.228"
 

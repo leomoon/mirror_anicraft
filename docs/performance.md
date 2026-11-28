@@ -9,6 +9,8 @@ oracle; its output must stay bit-identical).
 ```sh
 cargo run --release -p anicraft-cli -- bench                      # 50 layers × 200 shapes × 240 frames
 cargo run --release -p anicraft-cli -- bench --layers 200 --shapes 500 --frames 600
+cargo run --release -p anicraft-cli -- bench --stroke 6000        # one long Brush stroke (ADR 0129)
+cargo run --release -p anicraft-cli -- bench --stroke-file drawing.anicraft   # the same steps on a file
 ```
 
 `bench` builds a deterministic stress document (`doc::sample::stress`) and reports file size,
@@ -37,11 +39,58 @@ The default `bench` scenario: 50 layers × 200 shapes × 240 frames, 200k elemen
 | UI frame while rendering | never blocked | worker thread ✅ | design (ADR 0002) |
 | Autosave: time on the editing thread | < 1 ms | 7–15 µs ✅ | `bench --check` |
 | Autosave of the 65 MB file, in the background | < 2 s | 183–184 ms ✅ | `bench --check` |
+| A long Brush stroke: tracing its outline (ADR 0129) | bounded: `MAX_STAMP_WORK` cells visited, whatever the stroke | 45 to 310 ms for 1,500 to 100,000 samples, sizes 3 to 60 (2026-11-21; 1,500 ms and growing before) | test, every PR (the budget, not the time) |
+| A long Brush stroke in the editor | the trace is never on the window's thread | worker thread ✅; the merge (75 to 220 ms at the largest) still is | test, every PR |
 | GPU stage, 1,000 shapes at 4K, stage tiles (M3 exit) | < 16.7 ms | 4.5–4.7 ms ✅ (2026-11-10, RTX 5090) | `gpu_bench --check` |
 | GPU stage, 10k shapes at 4K, stage tiles | < 16.7 ms | 10.1–10.4 ms ✅ | `gpu_bench --check` |
 | GPU stage, 50k shapes at 1080p, stage tiles | < 33.3 ms (30 fps) | 24.8–26.3 ms ✅ | `gpu_bench --check` |
 | GPU stage, 50k shapes at 4K, one texture | < 33.3 ms | 22.5–23.8 ms ✅ | `gpu_bench --check` |
 | GPU stage, onion ±5 outlines / tinted at 1080p, stage tiles | ≤ 1.25 | 1.03–1.06 ✅ | `gpu_bench --check` |
+
+**Memory and frame time stay flat (2026-11-23, P-004, ADR 0132; #314, #477).** Measured
+before changing anything, then after, on the same machine (release, 32 threads).
+
+*What the picture cache holds.* A drag makes a new document state on every pointer move, a
+zoom gesture a new zoom level on every frame, and each one's tiles used to stay until the
+768 MB budget (256 MB in the web build) was full.
+
+| Scenario | Before | After |
+|---|---|---|
+| Web build in Node (`tests/wasm.rs`): WebAssembly memory over a drag of 120 moves, a 1024 × 512 view | 27 MB to 255 MB (the cache at 240 MB) | 27 MB throughout (the cache at 4 MB) |
+| Desktop, Ctrl+wheel from fit to 6400 % (84 frames): pictures cached | 147 pictures, 136 MB | 44 pictures, 44 MB (the view and the ring around it, at this zoom and the one before) |
+| Desktop, a drag of 300 moves in a 1600 × 940 window: pictures cached, textures, process memory | not run; by the sizes below a move adds a view of about 12 MB, so the 768 MB budget is full after some 60 moves | 42 pictures (38 MB), 12 textures, the process at 102 MB |
+| Desktop, the sample's 48 frames played five times in that window | the budget | the same: 768 MB of pictures after the first lap and after the fifth (the movie at this size is larger than the budget), 192 textures, the process at 814 to 826 MB |
+
+*A stage view at each zoom*, 1600 × 900 in 512 px tiles on the CPU oracle, a drawing of 64
+brush strokes merged into three shapes
+(`cargo test --release -p anicraft-engine --lib stage_timings -- --ignored --nocapture`):
+
+| Zoom | Tiles | Edges walked, before | after | Prepare, before | after | One thread (as the browser draws), before | after | 32 threads, before | after |
+|---|---|---|---|---|---|---|---|---|---|
+| 100 % | 6 | 42,708 | 21,935 | 1.27 ms | 1.41 ms | 9.0 ms | 8.1 ms | 2.8 ms | 2.9 ms |
+| 400 % | 12 | 133,288 | 31,317 | 2.94 ms | 2.08 ms | 31.7 ms | 23.3 ms | 8.0 ms | 8.3 ms |
+| 1600 % | 12 | 226,884 | 22,901 | 3.67 ms | 2.14 ms | 34.4 ms | 20.1 ms | 8.7 ms | 7.9 ms |
+| 6400 % | 8 | 281,304 | 13,416 | 3.34 ms | 1.32 ms | 33.5 ms | 13.0 ms | 6.7 ms | 6.2 ms |
+
+Before, a tile walked every edge of every shape that touched it, cut finer the deeper the
+zoom; now the parts of a fill above, below and right of the tile are left out, and the
+pictures are the same to the last bit (`render::cut_tests` compares the float pixmaps). On one
+thread a tile at 6400 % costs what a tile at 100 % costs (1.6 ms against 1.4 ms; it was 4.2 ms
+against 1.5 ms). With 512 strokes the same view went from 25.1 ms to 12.0 ms on one thread.
+
+*Frame time during a zoom gesture.* The stage asks for nothing while the zoom is changing, so
+a frame of the gesture costs the interface alone (0.7 ms on the desktop, at every zoom up to 6400 %). In the
+browser each of those frames used to draw the whole view on the interface's thread: 9 to
+34 ms for the drawing above.
+
+Playing is bounded by the budget, not by this change: uncompressed, a 1600 × 940 view is
+about 12 MB a frame, so a movie of some 60 frames fills 768 MB. Storing flat and repeated
+tiles once is the next step (P-004 in the roadmap).
+
+The checks are relations, not timings (`engine::render_budget_tests`,
+`stage_budget_tests`, `render::cut_tests`, `tests/wasm.rs`): a long drag or zoom holds what a
+short one holds, playing longer adds nothing, a deep tile walks fewer edges than the whole
+drawing has at 100 %, and what the screen needs is drawn before look-ahead.
 
 **1080p render, back under budget (2026-11-06).** It had drifted to 19.4–20.2 ms (v0.1.0
 measured 18.0–18.9 ms on the same machine; the 16.5 ms of 2026-10-28 didn't reproduce).
@@ -74,6 +123,26 @@ to 0.85 ms, and evaluating the extra frames in parallel brought the whole to 3.0
 is unchanged (the onion tests compare items and pixels). The settings are part of every tile's
 key, so the frame cache keeps working: looking at the same frame again is 40 hits in 0.02 ms,
 and other settings are other pictures.
+
+**Strokes as one outline (2026-11-17, ADR 0110).** The stroker used to hand the rasterizers a
+quad per segment and a disc or fan per bend, whose overlaps made edge pixels too dark. It now
+builds one outline per run of segments and unites them (`anicraft_geom::polygons::union`, about
+60 ns an edge on an outline that is already nearly clean; uniting the old pieces would have
+cost 1.6 ms for one wide curve). The stroker itself is about three times slower (a wide curve:
+20 → 60 µs) and the rasterizers get 3 to 4 times fewer edges. CPU oracle, median of 80
+renders, 32 threads, before → after:
+
+| Scene | Edges | Before | After |
+|---|---|---|---|
+| 2,000 outlined ovals, stars and rounded rectangles, 1920 × 1080 | 703,000 → 254,000 | 9.3 ms | 9.0 ms |
+| The demo scene, 1280 × 720 | 1,345 → 767 | 2.5 ms | 2.6 ms |
+| Seven tangled lines (waves, dashes, a knot, a hairpin), 400 × 300 | 4,995 → 1,347 | 0.51 ms | 0.63 ms |
+| The same at 300 % | 12,341 → 2,284 | 2.5 ms | 2.65 ms |
+| 300 self-crossing scribbles, 1280 × 720 | 499,000 → 126,000 | 5.9 ms | 6.4 ms |
+
+Convex closed outlines (rectangles, ovals, rounded rectangles) and straight lines skip the
+union: their outline can't overlap. Output changes only at stroke edges (14 corpus goldens
+regenerated; ADR 0110 lists what changed).
 
 **Outlines as hairlines (2026-11-10, ADR 0048).** Outline mode drew half-pixel strokes (four
 edges per segment and a disc at every bend); it now draws hairlines, one edge per segment,
@@ -215,6 +284,32 @@ Vulkan only. With CPU binning, DX12's onion outlines take 10.1 ms in tiles again
 The CPU stage (the oracle through the render service's 256 px tiles, `onion_timings`, best of
 frames 12, 30 and 48) with hairlines: onion ±5 outlines **17.1 ms** against 14.8 tinted at
 1080p (was 34–39 against 16.2–17.2).
+
+### Gradient selection stipple (#295)
+
+The selection overlay inverts the artwork's 256-entry gradient ramp with alpha ignored. It
+checks the colour range and midpoint of each 64-device-pixel strip before testing the pixels
+covered by dots. Sharp lookup transitions and a possible radial minimum inside a strip trigger
+refinement. One frame shares a limit of 131,072 pixel probes and 16,384 extra rectangles over
+all gradient fills. Each fill reserves some of its allowance for later scanline spans.
+
+After a span or frame uses its allowance, the remaining strips blend their corner colours.
+This keeps the entire selected area covered. Some narrow transitions can be softened or missed
+on busy fills. Features missing from the artwork's lookup table also stay out of the stipple.
+
+Two optimized CPU benchmark runs used identical pre-clipped 3840 × 2160 spans, with 31 timed
+mesh builds per implementation after warm-up. The 14-stop elliptical radial had an offset
+focal point, two clusters of close stops, a 31° rotation, and non-uniform scale. Times are the
+range of the two medians and include mesh allocation. Span preparation and drawing are outside
+the timings.
+
+| Spread | Original mesh | Pixel-by-pixel adaptive mesh | Bounded mesh |
+|---|---:|---:|---:|
+| Pad | 32,460 rectangles, 9.1–10.7 ms | 54,992 rectangles, 106.2–126.2 ms | 48,405 rectangles, 10.5–12.3 ms |
+| Reflect | 32,460 rectangles, 15.2–18.9 ms | 68,675 rectangles, 211.2–225.2 ms | 48,844 rectangles, 18.5–22.1 ms |
+
+The bounded mesh took 1.15–1.21× the original CPU time in these runs. The reflected fill can
+still exceed a 60 fps frame budget on this machine.
 
 ### How budgets are enforced
 

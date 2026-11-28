@@ -18,7 +18,7 @@ fn el(doc: &mut Document, name: &str, transform: Affine, kind: ElementKind) -> A
 }
 
 fn instance(symbol: SymbolId) -> ElementKind {
-    ElementKind::Symbol { symbol, loop_mode: LoopMode::Loop, first_frame: 0, blend: crate::BlendMode::Normal, filters: Vec::new(), events: Vec::new() }
+    ElementKind::Symbol { symbol, loop_mode: LoopMode::Loop, first_frame: 0, blend: crate::BlendMode::Normal, filters: Vec::new(), events: Vec::new(), pivot: None }
 }
 
 fn pose(tx: f32, ty: f32, sx: f32, sy: f32, rotation_deg: f32) -> Affine {
@@ -41,7 +41,7 @@ fn key(start: u32, duration: u32, elements: Vec<Arc<Element>>, tween: Option<Eas
 
 /// Builds the demo document: a bouncing ball, a spinning star, a pulsing sun over hills.
 pub fn demo() -> Document {
-    let mut d = Document { stage: Stage { width: 1280, height: 720, fps: 24.0, background: Rgba::WHITE }, scenes: vec![Arc::new(crate::Scene::new("Scene 1"))], library: Vec::new(), bitmaps: Vec::new(), sounds: Vec::new(), library_tree: Default::default(), document_class: String::new(), publish: Default::default(), aids: Default::default(), swatches: Arc::new(crate::swatch::default_set()), eases: Default::default(), next_id: 1 };
+    let mut d = Document { stage: Stage { width: 1280, height: 720, fps: 24.0, background: Rgba::WHITE }, scenes: vec![Arc::new(crate::Scene::new("Scene 1"))], library: Vec::new(), bitmaps: Vec::new(), sounds: Vec::new(), library_tree: Default::default(), document_class: String::new(), publish: Default::default(), aids: Default::default(), swatches: Arc::new(crate::swatch::default_set()), eases: Default::default(), data: Default::default(), next_id: 1 };
     let (w, h) = (1280.0, 720.0);
 
     // --- library -------------------------------------------------------------------------
@@ -143,12 +143,46 @@ pub fn demo() -> Document {
     d
 }
 
+/// An arm of three parented layers (ADR 0113): the forearm follows the upper arm and the hand
+/// follows the forearm, while each keeps its own classic tween. Every part is drawn from its
+/// joint, so a part's own rotation bends that joint.
+pub fn arm() -> Document {
+    let mut d = Document { stage: Stage { width: 960, height: 540, fps: 24.0, background: Rgba::hex(0xf4f1ea) }, ..demo_base() };
+    // A limb drawn from its joint at the origin along +x, with a round joint.
+    let limb = |len: f32, thick: f32, fill: u32, line: u32| {
+        let mut p = Path::rounded_rect(-thick * 0.5, -thick * 0.5, len + thick, thick, thick * 0.5);
+        p.cmds.extend(Path::ellipse(0.0, 0.0, thick * 0.18, thick * 0.18).cmds);
+        Shape { fill_rule: anicraft_geom::FillRule::EvenOdd, ..Shape::filled(p, Paint::Solid(Rgba::hex(fill))).with_stroke(Rgba::hex(line), 3.0) }
+    };
+    let (upper, fore, hand) = (LayerId(d.alloc_id()), LayerId(d.alloc_id()), LayerId(d.alloc_id()));
+    // One object per layer, the same id on both keyframes: keyed at 0 and 24, tweened between.
+    let part = |d: &mut Document, id: LayerId, name: &str, color: u32, shape: Shape, from: Affine, to: Affine| {
+        let eid = ElementId(d.alloc_id());
+        let at = |m: Affine| Arc::new(Element { id: eid, name: name.into(), transform: m, color: ColorEffect::default(), kind: ElementKind::Shape(shape.clone()) });
+        layer(id.0, name, color, vec![key(0, 24, vec![at(from)], Some(Easing::QuadInOut)), key(24, 1, vec![at(to)], None)])
+    };
+    // Each child's keys are in its parent's space: the forearm starts at the upper arm's far
+    // end (its length along +x), the hand at the forearm's.
+    let upper_l = part(&mut d, upper, "Upper arm", 0xff8a3d, limb(170.0, 54.0, 0xe9a36b, 0x7a4a22), pose(300.0, 190.0, 1.0, 1.0, 70.0), pose(300.0, 190.0, 1.0, 1.0, 10.0));
+    let mut fore_l = part(&mut d, fore, "Forearm", 0x4fa3ff, limb(150.0, 44.0, 0xf0b98a, 0x7a4a22), pose(170.0, 0.0, 1.0, 1.0, -20.0), pose(170.0, 0.0, 1.0, 1.0, -75.0));
+    let mut hand_l = part(&mut d, hand, "Hand", 0x58c26b, limb(46.0, 50.0, 0xf6cfa8, 0x7a4a22), pose(150.0, 0.0, 1.0, 1.0, 15.0), pose(150.0, 0.0, 1.0, 1.0, -35.0));
+    Arc::make_mut(&mut fore_l).rig_parent = Some(upper);
+    Arc::make_mut(&mut hand_l).rig_parent = Some(fore);
+    d.timeline_mut(0).layers = vec![hand_l, fore_l, upper_l];
+    d
+}
+
+/// An empty document with the demo's defaults.
+fn demo_base() -> Document {
+    Document { stage: Stage { width: 1280, height: 720, fps: 24.0, background: Rgba::WHITE }, scenes: vec![Arc::new(crate::Scene::new("Scene 1"))], library: Vec::new(), bitmaps: Vec::new(), sounds: Vec::new(), library_tree: Default::default(), document_class: String::new(), publish: Default::default(), aids: Default::default(), swatches: Arc::new(crate::swatch::default_set()), eases: Default::default(), data: Default::default(), next_id: 1 }
+}
+
 /// A small interactive movie (ADR 0024): a menu that stops on its first frame with a Play
 /// button; clicking it plays a short show (a spinning movie clip and a ball rolling across),
 /// whose last frame traces a line and goes back to the menu.
 pub fn interactive() -> Document {
     use crate::actions::{Action, ButtonEvent, EventHandler, FrameRef, FrameScript, Target};
-    let mut d = Document { stage: Stage { width: 1280, height: 720, fps: 24.0, background: Rgba::hex(0x1d2333) }, scenes: vec![Arc::new(crate::Scene::new("Scene 1"))], library: Vec::new(), bitmaps: Vec::new(), sounds: Vec::new(), library_tree: Default::default(), document_class: String::new(), publish: Default::default(), aids: Default::default(), swatches: Arc::new(crate::swatch::default_set()), eases: Default::default(), next_id: 1 };
+    let mut d = Document { stage: Stage { width: 1280, height: 720, fps: 24.0, background: Rgba::hex(0x1d2333) }, scenes: vec![Arc::new(crate::Scene::new("Scene 1"))], library: Vec::new(), bitmaps: Vec::new(), sounds: Vec::new(), library_tree: Default::default(), document_class: String::new(), publish: Default::default(), aids: Default::default(), swatches: Arc::new(crate::swatch::default_set()), eases: Default::default(), data: Default::default(), next_id: 1 };
     const LEN: u32 = 36;
     let solid = |c: u32| Paint::Solid(Rgba::hex(c));
 
@@ -208,11 +242,41 @@ pub fn interactive() -> Document {
     d
 }
 
+/// A document whose symbols double at every level: `levels` symbols in a chain, each holding
+/// two instances of the next and the last one a square, so the one instance on the stage is
+/// 2^(`levels` - 1) squares, with no cycle anywhere and nothing nested deeper than
+/// [`crate::MAX_SYMBOL_DEPTH`]. Past twenty levels it is more than a frame's allowance of work
+/// ([`crate::MAX_EVAL_ELEMENTS`], ADR 0128): what tests and benchmarks use for a document too
+/// large to draw.
+pub fn doubling(levels: u32) -> Document {
+    let levels = u64::from(levels.clamp(1, 31));
+    let mut d = Document::default();
+    let at = |id: u64, x: f32, kind: ElementKind| Arc::new(Element { id: ElementId(id), name: String::new(), transform: Affine::translate(x, 0.0), color: ColorEffect::default(), kind });
+    let on_one_layer = |id: u64, elements: Vec<Arc<Element>>| {
+        let mut l = Layer::new(LayerId(id), "l");
+        l.keyframes = vec![Arc::new(key(0, 1, elements, None))];
+        Timeline { layers: vec![Arc::new(l)] }
+    };
+    for level in 0..levels {
+        let elements = if level + 1 == levels {
+            vec![at(5000, 0.0, ElementKind::Shape(Shape::filled(Path::rect(0.0, 0.0, 10.0, 10.0), Paint::Solid(Rgba::BLACK))))]
+        } else {
+            vec![at(2000 + level, 0.0, instance(SymbolId(101 + level))), at(3000 + level, 1.0, instance(SymbolId(101 + level)))]
+        };
+        let timeline = on_one_layer(1000 + level, elements);
+        d.library.push(Arc::new(Symbol { id: SymbolId(100 + level), name: format!("s{level}"), kind: SymbolKind::Graphic, linkage: None, scale_grid_kept: None, scale_grid: None, timeline }));
+    }
+    let root = on_one_layer(1, vec![at(1, 0.0, instance(SymbolId(100)))]);
+    d.timeline_mut(0).layers = root.layers;
+    d.next_id = 10_000;
+    d
+}
+
 /// Deterministic stress document for benchmarks and scaling tests: `layers` layers with
 /// `shapes` shapes each, keyed every 12 frames over `frames` frames with classic tweens.
 /// Every element keeps one `Arc<Path>` across its keyframes, as a real tweened shape does.
 pub fn stress(layers: u32, shapes: u32, frames: u32) -> Document {
-    let mut d = Document { stage: Stage { width: 1920, height: 1080, fps: 24.0, background: Rgba::WHITE }, scenes: vec![Arc::new(crate::Scene::new("Scene 1"))], library: Vec::new(), bitmaps: Vec::new(), sounds: Vec::new(), library_tree: Default::default(), document_class: String::new(), publish: Default::default(), aids: Default::default(), swatches: Arc::new(crate::swatch::default_set()), eases: Default::default(), next_id: 1 };
+    let mut d = Document { stage: Stage { width: 1920, height: 1080, fps: 24.0, background: Rgba::WHITE }, scenes: vec![Arc::new(crate::Scene::new("Scene 1"))], library: Vec::new(), bitmaps: Vec::new(), sounds: Vec::new(), library_tree: Default::default(), document_class: String::new(), publish: Default::default(), aids: Default::default(), swatches: Arc::new(crate::swatch::default_set()), eases: Default::default(), data: Default::default(), next_id: 1 };
     let (layers, shapes, frames) = (layers.clamp(1, 1000), shapes.clamp(1, 100_000), frames.clamp(1, 10_000));
     let mut seed = 0x2545_f491_u32;
     let mut rnd = move || {

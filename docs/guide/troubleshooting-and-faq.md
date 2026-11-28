@@ -11,7 +11,9 @@ AniCraft draws its window with your graphics card through a modern graphics inte
 Metal or DirectX 12). If that fails to start, which happens on some older cards, laptops with two
 graphics chips, virtual machines and Linux setups, AniCraft tries the next way by itself: on
 Windows, DirectX 12 on the built-in graphics chip, and then OpenGL everywhere. If a graphics
-driver crashes or hangs while AniCraft starts, the next start tries that way last.
+driver crashes or hangs while AniCraft starts, start AniCraft again: it tries that way last,
+for the next five starts, then gives it one more chance (a driver update may have fixed it) and
+holds it back for longer if it fails again.
 
 If no way works, AniCraft says so in a message and names its **start-up log**, a text file that
 records each way it tried and why it failed. Please attach it to your bug report. It is
@@ -105,6 +107,17 @@ variable `ANICRAFT_FFMPEG` to the full path of the `ffmpeg` program. The web ver
 ffmpeg at all: export an animated GIF, animated PNG or WebP, a PNG sequence or an HTML page
 instead. See [Exporting and publishing](exporting-and-publish.md).
 
+## Importing a video doesn't work
+
+**File › Import › Import Video…** reads video with ffmpeg, which you install yourself (AniCraft
+has no video decoder of its own). If the window says ffmpeg could not be started, install ffmpeg
+so it is on your `PATH`, or set the environment variable `ANICRAFT_FFMPEG` to the full path of
+the `ffmpeg` program, then import again. If it says the file has no video ffmpeg can read, the
+file is damaged or in a format your ffmpeg wasn't built with.
+
+A reference layer that shows only an outline has lost its file: open **Layer Properties** and
+choose **Relink…**. See [Importing video](images-and-sound.md#importing-video).
+
 ## AniCraft closed unexpectedly
 
 Your unsaved work is probably safe. AniCraft keeps a recovery copy in the background (every
@@ -123,6 +136,9 @@ If the status bar ever says "Autosave failed", save your work by hand; AniCraft 
 
 Preferences, shortcuts, recent files, recovery copies, your templates and your plug-ins all live
 in one settings folder. Its path is shown at the bottom of the Preferences window.
+
+A [portable copy](getting-started.md#portable-copies) keeps its settings in a `data` folder beside
+AniCraft. If that folder can't be written to, AniCraft uses the standard settings folder below.
 
 | System | Settings folder |
 |---|---|
@@ -146,10 +162,13 @@ damaged preferences file never stops AniCraft from starting: it falls back to th
   icon, or use **Open With › AniCraft**, whether AniCraft is running or not. If you have unsaved
   changes, AniCraft asks first. This is new and still being checked on real Macs; if it doesn't
   work for you, use **File › Open…** and please report it.
-* **An old `.fla`**: files saved by Flash CS4 or earlier use an older format. AniCraft says so;
-  open the file in Animate, save it again, then open that copy.
+* **An old `.fla`**: files saved by Flash 8, CS3 or CS4 open, with a few things left out (see
+  [Flash 8 to CS4 files](opening-animate-files.md#flash-8-to-cs4-files)). Files from Flash MX
+  2004 or earlier can't be opened yet. AniCraft says so; open the file in Animate, save it
+  again, then open that copy.
 * **A damaged `.fla`**: AniCraft refuses it with a sentence that says what is wrong, and never
-  writes anything from it to your disk.
+  writes anything from it to your disk. Version 0.2.1 said "the central directory is outside the
+  archive" about most files saved by Flash and Animate, which were not damaged: that is fixed.
 
 ## Other desktop quirks
 
@@ -160,7 +179,7 @@ damaged preferences file never stops AniCraft from starting: it falls back to th
   where windows go. To keep the movie inside the editor, turn off **Preferences › Test Movie ›
   Play Test Movie in a window of its own**.
 * **A shortcut doesn't do anything.** Check what the key is bound to in **Help › Keyboard
-  Shortcuts** (**F1**): type the key in the filter. See
+  Shortcuts** (**Ctrl+Alt+Shift+K**): type the key in the filter. See
   [Preferences, shortcuts, accessibility and languages](preferences-shortcuts-accessibility.md).
 
 ## The web version
@@ -219,8 +238,9 @@ a report after opening. Motion tweens from Animate files are not imported yet. S
 
 ### Can it save back to `.fla`?
 
-No. AniCraft saves its own `.anicraft` format, and an opened Animate file comes in as a new,
-untitled document, so saving never overwrites the original.
+No. AniCraft saves its own `.anicraft` format. An opened Animate file keeps its name, marked
+as imported, but saving always asks for a new `.anicraft` name, so it never overwrites the
+original.
 
 ### Can it export SWF?
 
@@ -247,8 +267,8 @@ honest, detailed status is in the project's roadmap on GitHub.
 
 ### Can I open several documents at once?
 
-Not yet. AniCraft works on one document at a time for now. Opening another asks you to save
-the current one first if it has unsaved changes.
+Yes. Each open document has a tab below the menu bar, and you can copy artwork from one and
+paste it into another. See [Document tabs](workspace.md#document-tabs).
 
 ### Is the interface available in my language?
 
@@ -259,4 +279,4 @@ Not yet. The interface is ready for translation, but it is in English only today
 
 Yes, if you want it to. `anicraft-cli mcp` lets an assistant that supports the Model Context
 Protocol draw, animate and export through AniCraft's commands. It is never on unless you set it
-up. See [Working headless](working-headless.md).
+up, and it reads and writes files only in the folders you name when you do. See [Working headless](working-headless.md).

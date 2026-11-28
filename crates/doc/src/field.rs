@@ -7,9 +7,23 @@
 //! [`FieldLook`] whenever a field's text changes and keeps it in the state; drawing a state then
 //! needs nothing else.
 
-use crate::{FIELD_GUTTER, LineType, MAX_FIELD_CHARS, TextBlock, TextField, TextKind};
+use crate::html_text::RichStyles;
+use crate::{FIELD_GUTTER, LineType, MAX_FIELD_CHARS, Rgba, TextBlock, TextField, TextKind};
 use anicraft_geom::{Path, Vec2};
 use std::sync::Arc;
+
+/// Where one cluster (a letter with its marks, or a ligature) stands on its line (ADR 0130).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CaretBox {
+    /// The characters it covers: from `start` up to `end`.
+    pub start: u32,
+    pub end: u32,
+    /// Its left and right edges, from the text's left edge.
+    pub x0: f32,
+    pub x1: f32,
+    /// It reads right to left.
+    pub rtl: bool,
+}
 
 /// One laid-out line's characters and caret places (indices count `char`s of the shown text).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -17,12 +31,61 @@ pub struct CaretLine {
     /// The first character on the line and the boundary after its last.
     pub start: u32,
     pub end: u32,
-    /// `(index, x)` of the boundaries glyphs start at and of the line's end, ascending; `x` from
-    /// the text's left edge (the box's, less the gutter).
+    /// `(index, x)` of the boundaries clusters start at and of the line's end, ascending by
+    /// index; `x` from the text's left edge (the box's, less the gutter). A boundary is at the
+    /// edge its cluster is read from, so in text that mixes directions `x` does not rise with
+    /// the index.
     pub stops: Vec<(u32, f32)>,
+    /// The paragraph reads right to left: the line starts at its right end (ADR 0130).
+    pub rtl: bool,
+    /// The line's clusters as they are displayed, left to right. Empty: every character reads
+    /// left to right, one after another, as `stops` has them.
+    pub boxes: Vec<CaretBox>,
 }
 
 impl CaretLine {
+    /// Whether anything on the line reads right to left.
+    pub fn mixed(&self) -> bool {
+        self.rtl || self.boxes.iter().any(|b| b.rtl)
+    }
+
+    /// The stretches of the line a selection from boundary `a` to `b` highlights, as left and
+    /// right x, left to right. Text in one direction is one stretch; a selection across a change
+    /// of direction is several (ADR 0130). A cluster is highlighted whole.
+    pub fn spans(&self, a: u32, b: u32) -> Vec<(f32, f32)> {
+        let (a, b) = (a.max(self.start), b.min(self.end));
+        if a >= b {
+            return Vec::new();
+        }
+        if self.boxes.is_empty() {
+            let x0 = self.x_at(a);
+            return vec![(x0, self.x_at(b).max(x0))];
+        }
+        let mut out: Vec<(f32, f32)> = Vec::new();
+        for c in self.boxes.iter().filter(|c| c.start < b && c.end > a) {
+            match out.last_mut() {
+                Some(last) if (last.1 - c.x0).abs() < 1e-3 => last.1 = c.x1,
+                _ => out.push((c.x0, c.x1)),
+            }
+        }
+        out
+    }
+
+    /// The boundary the Left or Right key takes a caret at `i` to: the next place a caret can
+    /// stand in that direction on this line, by where it is displayed. `None` at the line's
+    /// edge. `open`: the line's end is shown on the next line (a wrapped line), so the caret
+    /// doesn't stand there.
+    pub fn step(&self, i: u32, right: bool, open: bool) -> Option<u32> {
+        let mut places: Vec<(u32, f32)> = self.stops.iter().copied().filter(|s| (self.start..=self.end).contains(&s.0) && !(open && s.0 == self.end && s.0 > self.start)).collect();
+        // Left to right; places at one x in the order the paragraph reads.
+        places.sort_by(|p, q| p.1.total_cmp(&q.1).then(if self.rtl { q.0.cmp(&p.0) } else { p.0.cmp(&q.0) }));
+        // Inside a cluster, the caret is at the cluster's start.
+        let here = places.iter().map(|p| p.0).filter(|c| *c <= i).max()?;
+        let at = places.iter().position(|p| p.0 == here)?;
+        let next = if right { at.checked_add(1)? } else { at.checked_sub(1)? };
+        places.get(next).map(|p| p.0)
+    }
+
     /// The caret's x at boundary `i`.
     pub fn x_at(&self, i: u32) -> f32 {
         let mut x = self.stops.first().map_or(0.0, |s| s.1);
@@ -53,6 +116,9 @@ impl CaretLine {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FieldLook {
     pub outline: Arc<Path>,
+    /// The outline cut by colour, when the text has several (`htmlText`, ADR 0107): drawn in
+    /// place of `outline`. Empty: all of it in the field's colour.
+    pub pieces: Arc<[(Rgba, Arc<Path>)]>,
     /// Top line first; never empty.
     pub lines: Arc<[CaretLine]>,
     /// From one line's top to the next's.
@@ -83,6 +149,25 @@ impl FieldLook {
         Vec2::new(x, n as f32 * self.line_height)
     }
 
+    /// Where the Left or Right key takes a caret at boundary `i` in text that mixes directions
+    /// (ADR 0130): the next place to that side as displayed, and at a line's edge the line
+    /// before or after it, whichever lies that way in its paragraph's direction. `None` on a
+    /// line that reads left to right throughout: the key moves one character.
+    pub fn step(&self, i: u32, right: bool) -> Option<u32> {
+        let n = self.line_of(i);
+        let line = self.lines.get(n).filter(|l| l.mixed())?;
+        let next = self.lines.get(n + 1);
+        if let Some(to) = line.step(i, right, next.is_some_and(|m| m.start == line.end)) {
+            return Some(to);
+        }
+        // The line's edge: back to the line before, or on to the line after.
+        Some(if right == line.rtl {
+            if n == 0 { i } else { line.start.saturating_sub(1) }
+        } else {
+            next.map_or(i, |m| m.start)
+        })
+    }
+
     /// The boundary nearest a point in the text's space.
     pub fn index_at(&self, p: Vec2) -> u32 {
         let h = self.line_height.max(1e-3);
@@ -106,6 +191,13 @@ pub struct FieldState {
     pub anchor: u32,
     /// How far the text has scrolled to keep the caret in view (pixels, never negative).
     pub scroll: Vec2,
+    /// The text's styles once a script set `htmlText` (ADR 0107); `None`: the field's own
+    /// style (or, while `text` is `None`, the authored runs).
+    pub rich: Option<Arc<RichStyles>>,
+    /// `maxChars` once a script set it (`None`: the field's own).
+    pub max_chars: Option<u32>,
+    /// `restrict` once a script set it: the characters a viewer may type (`None`: any).
+    pub restrict: Option<String>,
 }
 
 impl FieldState {
@@ -147,6 +239,45 @@ pub fn chars(s: &str) -> u32 {
 pub fn fit(field: &TextField, text: &str) -> String {
     let _ = field;
     text.replace("\r\n", "\n").replace('\r', "\n").chars().take(MAX_FIELD_CHARS).collect()
+}
+
+/// Whether `restrict` lets a viewer type `c` (ADR 0107), as ActionScript's
+/// `TextField.restrict` reads: the characters listed are allowed, `a-z` is a range, a `^`
+/// turns what follows into characters that are not allowed (and back), and `\` before `-`,
+/// `^` or `\` makes it a plain character. A string starting with `^` allows everything else;
+/// an empty string allows nothing.
+pub fn allowed(restrict: &str, c: char) -> bool {
+    let r: Vec<char> = restrict.chars().take(1024).collect();
+    let mut ok = r.first() == Some(&'^');
+    let mut include = true;
+    let mut i = 0;
+    // One character of the list at `i` (escapes read), and the index after it.
+    let item = |i: usize| -> Option<(char, usize)> {
+        match r.get(i).copied()? {
+            '\\' => r.get(i + 1).map(|c| (*c, i + 2)),
+            ch => Some((ch, i + 1)),
+        }
+    };
+    while i < r.len() {
+        if r.get(i) == Some(&'^') {
+            include = !include;
+            i += 1;
+            continue;
+        }
+        let Some((lo, next)) = item(i) else { break };
+        i = next;
+        let mut hi = lo;
+        if r.get(i) == Some(&'-')
+            && let Some((end, after)) = item(i + 1)
+        {
+            hi = end;
+            i = after;
+        }
+        if (lo..=hi).contains(&c) {
+            ok = include;
+        }
+    }
+    ok
 }
 
 /// What an editing key does (the ActionScript key codes the player receives).
@@ -212,11 +343,17 @@ impl Editor<'_> {
             return Changed::default();
         }
         let one = !self.field.lines.multiline();
-        let mut add: String = s.chars().filter(|c| !c.is_control() || (*c == '\n' && !one)).collect();
+        let restrict = self.st.restrict.clone();
+        let mut add: String = s.chars().filter(|c| !c.is_control() || (*c == '\n' && !one)).filter(|c| *c == '\n' || restrict.as_deref().is_none_or(|r| allowed(r, *c))).collect();
+        // Typing only what the field refuses does nothing (it doesn't delete the selection).
+        if add.is_empty() && !s.is_empty() {
+            return Changed::default();
+        }
         let (a, b) = self.st.selection();
         let value = self.st.value(self.block).to_string();
         let kept = chars(&value) - (b - a);
-        let room = if self.field.max_chars > 0 { self.field.max_chars.saturating_sub(kept) } else { u32::MAX };
+        let max = self.st.max_chars.unwrap_or(self.field.max_chars);
+        let room = if max > 0 { max.saturating_sub(kept) } else { u32::MAX };
         let room = room.min((MAX_FIELD_CHARS as u32).saturating_sub(kept));
         if chars(&add) > room {
             add = add.chars().take(room as usize).collect();
@@ -229,6 +366,12 @@ impl Editor<'_> {
         next.push_str(&add);
         next.push_str(slice(&value, b, u32::MAX));
         let caret = a + chars(&add);
+        // Styled text keeps its runs: what is typed continues the style before it (ADR 0085).
+        if let Some(rich) = &self.st.rich {
+            let runs = crate::rich_text::type_into_runs(&rich.runs, a, b, chars(&add));
+            let paragraphs = crate::rich_text::edit_paragraphs(&rich.paragraphs, &value, a, b, &add);
+            self.st.rich = Some(Arc::new(RichStyles { runs, paragraphs }));
+        }
         self.st.text = Some(next);
         self.st.caret = caret;
         self.st.anchor = caret;
@@ -254,12 +397,14 @@ impl Editor<'_> {
             }
             Edit::Left if !shift && a != b => moved(self.st, a, false),
             Edit::Right if !shift && a != b => moved(self.st, b, false),
+            // In text that mixes directions the caret moves the way the key points, as the
+            // text is displayed (ADR 0130); elsewhere one character back or on.
             Edit::Left => {
-                let to = self.st.caret.saturating_sub(1);
+                let to = look.and_then(|l| l.step(self.st.caret, false)).unwrap_or_else(|| self.st.caret.saturating_sub(1));
                 moved(self.st, to, shift)
             }
             Edit::Right => {
-                let to = self.st.caret.saturating_add(1);
+                let to = look.and_then(|l| l.step(self.st.caret, true)).unwrap_or_else(|| self.st.caret.saturating_add(1));
                 moved(self.st, to, shift)
             }
             Edit::Home | Edit::End | Edit::Up | Edit::Down => {
@@ -360,14 +505,14 @@ pub(crate) fn mono_look(text: &str, cw: f32, lh: f32, wrap: Option<f32>) -> Fiel
     let mut i = 0u32;
     for c in text.chars() {
         if c == '\n' {
-            lines.push(CaretLine { start, end: i, stops: std::mem::take(&mut stops) });
+            lines.push(CaretLine { start, end: i, stops: std::mem::take(&mut stops), ..CaretLine::default() });
             i += 1;
             (start, col) = (i, 0);
             stops.push((i, 0.0));
             continue;
         }
         if per.is_some_and(|p| col == p) {
-            lines.push(CaretLine { start, end: i, stops: std::mem::take(&mut stops) });
+            lines.push(CaretLine { start, end: i, stops: std::mem::take(&mut stops), ..CaretLine::default() });
             (start, col) = (i, 0);
             stops.push((i, 0.0));
         }
@@ -380,9 +525,9 @@ pub(crate) fn mono_look(text: &str, cw: f32, lh: f32, wrap: Option<f32>) -> Fiel
         stops.push((i, col as f32 * cw));
         width = width.max(col as f32 * cw);
     }
-    lines.push(CaretLine { start, end: i, stops });
+    lines.push(CaretLine { start, end: i, stops, ..CaretLine::default() });
     let n = lines.len();
-    FieldLook { outline: Arc::new(outline), lines: lines.into(), line_height: lh, width, height: n as f32 * lh }
+    FieldLook { outline: Arc::new(outline), pieces: Arc::from(Vec::new()), lines: lines.into(), line_height: lh, width, height: n as f32 * lh }
 }
 
 #[cfg(test)]

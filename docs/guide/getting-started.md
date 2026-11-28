@@ -14,9 +14,9 @@ lists every build, with a `SHA256SUMS.txt` file so you can check what you downlo
 
 | System | What to download | How to install |
 |---|---|---|
-| Windows (x64, ARM64 or 32-bit) | the `.msi` installer | Double-click it. By default it installs for your account only and doesn't need an administrator. You can choose to install it for everyone on the computer instead. A portable `.zip` is there too if you'd rather not install. |
+| Windows (x64 or ARM64) | the `.msi` installer | Double-click it. By default it installs for your account only and doesn't need an administrator. You can choose to install it for everyone on the computer instead. A portable `.zip` is there too if you'd rather not install. |
 | macOS (Apple silicon and Intel) | the `.dmg` | Open it and drag AniCraft to Applications. The app is signed and notarized. |
-| Linux (x86_64 or ARM64) | `.AppImage`, `.flatpak`, `.deb`, `.rpm` or `.tar.gz` | The AppImage runs anywhere. Install the Flatpak with `flatpak install --user` and the file name. Use the `.deb` on Debian and Ubuntu, and the `.rpm` on Fedora and openSUSE. |
+| Linux (x86_64 or ARM64) | `.AppImage`, `.flatpak`, `.deb`, `.rpm`, `.pkg.tar.zst` or `.tar.gz` | The AppImage runs anywhere. Install the Flatpak with `flatpak install --user` and the file name. Use the `.deb` on Debian and Ubuntu, the `.rpm` on Fedora and openSUSE, and the `.pkg.tar.zst` on Arch Linux (`pacman -U` and the file name). |
 | FreeBSD | the `.tar.gz` | Unpack it anywhere. |
 
 Every installer sets AniCraft up to open `.anicraft` documents. Animate's `.fla` and `.xfl`
@@ -49,8 +49,9 @@ shows it in an installed copy) into the portable copy's `data` folder.
 **Preferences › About** shows which kind of copy you are running and every folder it uses, each
 with an **Open** button.
 
-There is also a web version that runs in a modern browser. It can't play sound, export video
-or install plug-ins yet, and menu items that can't work there are dimmed and say why.
+There is also a web version that runs in a modern browser. Sound starts on your first play
+through Web Audio. It can't export video or install plug-ins yet, and menu items that can't
+work there are dimmed and say why.
 
 To get newer versions later, choose **Help › Check for Updates…**.
 
@@ -147,8 +148,10 @@ Documents are saved as `.anicraft` files. Each one is a single file that holds e
 including the images and sounds you imported. To save a copy under a new name, choose
 **File › Save As…** (**Ctrl+Shift+S**).
 
-AniCraft works on one document at a time. If you open or create another document while yours
-has unsaved changes, it asks you first, and it does the same when you quit.
+You can have several documents open, each in its own tab (see
+[Document tabs](workspace.md#document-tabs)). Opening or creating another document never
+closes yours. If you close a tab or quit while a document has unsaved changes, AniCraft asks
+you first.
 
 To start new documents from this one later, choose **File › Save as Template…**. Give the
 template a name and a category. It then appears under **My templates** on the start screen.
@@ -159,11 +162,12 @@ While you work, AniCraft quietly keeps a recovery copy of your unsaved changes. 
 does this every minute, or after 25 changes, whichever comes first. The status bar shows when
 it last did ("autosaved just now"). The copy never replaces your own file. It is kept in
 AniCraft's settings folder and removed when you save or quit normally. Drawing never waits
-for it.
+for it. Every open document has its own recovery copy.
 
-If AniCraft closes unexpectedly, the next start shows a **Recover unsaved work** window:
+If AniCraft closes unexpectedly, the next start shows a **Recover unsaved work** window. It
+lists every document that had unsaved changes:
 
-* **Restore** opens the work as an unsaved document. Save then puts it back where it was.
+* **Restore** opens the work as an unsaved document, in a tab of its own. Save then puts it back where it was.
   If the file was saved after the copy was made, Save asks for a new name instead, so
   nothing is overwritten.
 * **Discard…** deletes the copy. You have to confirm it, because this can't be undone.

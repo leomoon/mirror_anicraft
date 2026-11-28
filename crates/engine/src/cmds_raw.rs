@@ -46,7 +46,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Select Parts",
             "",
             None,
-            "{x0, y0, x1, y1, add?: bool} the marquee, on every visible, unlocked layer: the parts of raw fills and strokes under the rectangle (cut at its edges, per layer) and the objects wholly inside it",
+            "{x0, y0, x1, y1, add?: bool} the marquee, on every visible, unlocked layer: the parts of raw fills and strokes under the rectangle (cut at its edges, per layer) and the objects it touches",
             true,
             select_rect,
         ),
@@ -212,7 +212,34 @@ fn bend_segment(s: &mut Session, p: &Value) -> Result<Value> {
     let old = rawgeom::segment_cubic(&path, cmd).map(|c| rawgeom::transform(&c, &m)).ok_or_else(|| EngineError::Param(format!("no segment {cmd} on this shape")))?;
     let new = rawgeom::bend(&old, t, d).ok_or_else(|| EngineError::Param("cannot bend that segment".into()))?;
     let raw = mergeable(el).is_some();
-    let changed = edit_edge(s, id, cmd, &old, &new, raw)?;
+    // Both handles move, so the curves beyond its ends that were smooth there turn with them
+    // (as when a handle is dragged, ADR 0045), and the ends stay smooth.
+    let starts = crate::cmds_rawsub::opposite_handle(&els, el, raw, &old, 1);
+    let ends = crate::cmds_rawsub::opposite_handle(&els, el, raw, &old, 2);
+    let mut changed = edit_edge(s, id, cmd, &old, &new, raw)?;
+    let mut turns = Vec::new();
+    match (starts, ends) {
+        // One curve on both ends (a two-segment loop): turn both its handles at once.
+        (Some(f), Some(g)) if rawgeom::same_edge(&f, &g.reversed(), 1.5 * SNAP) => {
+            let (a, b) = (f.c[0], f.c[3]);
+            turns.push((f.c, [a, rawgeom::turned_opposite(a, new[1], f.c[1]), rawgeom::turned_opposite(b, new[2], f.c[2]), b]));
+        }
+        (f, g) => {
+            for (f, h) in [(f, new[1]), (g, new[2])] {
+                if let Some(f) = f {
+                    let a = f.c[0];
+                    turns.push((f.c, [a, rawgeom::turned_opposite(a, h, f.c[1]), f.c[2], f.c[3]]));
+                }
+            }
+        }
+    }
+    for (was, turned) in turns {
+        for e in follow_edge(s, (!raw).then_some(id), &was, &turned)? {
+            if !changed.contains(&e) {
+                changed.push(e);
+            }
+        }
+    }
     let point = cubic_point(&new, t.clamp(0.02, 0.98));
     if raw && merge_after {
         remerge_in_place(s, &changed)?;
@@ -604,7 +631,7 @@ fn on_editable_key(s: &Session) -> bool {
 }
 
 /// The marquee (ADR 0041, 0044): on every visible, unlocked layer, the parts of raw shapes under
-/// the rectangle (cut at its edges) and the objects wholly inside it.
+/// the rectangle (cut at its edges) and the objects it touches (#522).
 fn select_rect(s: &mut Session, p: &Value) -> Result<Value> {
     let a = Vec2::new(f32_req(p, "x0")?, f32_req(p, "y0")?);
     let b = Vec2::new(f32_req(p, "x1")?, f32_req(p, "y1")?);
@@ -616,8 +643,8 @@ fn select_rect(s: &mut Session, p: &Value) -> Result<Value> {
     if r.width() <= 0.0 || r.height() <= 0.0 {
         return Ok(json!({"selected": s.selection.id_list(), "cut": 0}));
     }
-    // What each layer has under the marquee, from one display list: wholly inside, or (raw
-    // shapes) partly.
+    // What each layer has under the marquee, from one display list: taken whole, or (raw
+    // shapes partly under it) cut.
     let mut found: Vec<(LayerId, Vec<ElementId>, Vec<ElementId>)> = Vec::new();
     let layers: Vec<LayerId> = s.timeline().layers.iter().map(|l| l.id).filter(|l| s.gathers(*l)).collect();
     for l in layers {
@@ -627,9 +654,11 @@ fn select_rect(s: &mut Session, p: &Value) -> Result<Value> {
             if bounds.is_empty() || bounds.intersect(&r).is_empty() {
                 continue;
             }
-            if contains(&r, &bounds) {
+            // An object (instance, group, drawing object, text, bitmap) the marquee touches is
+            // taken whole (#522); a raw shape partly under it is cut at its edges.
+            if contains(&r, &bounds) || mergeable(&e).is_none() {
                 picked.push(e.id);
-            } else if mergeable(&e).is_some() {
+            } else {
                 partial.push(e.id);
             }
         }
@@ -661,7 +690,8 @@ fn select_rect(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// The marquee on the active layer: raw shapes partly under `r` are cut at its edges and the
-/// parts inside are selected, the rest stay as they are; `picked` (wholly inside) are selected.
+/// parts inside are selected, the rest stay as they are; `picked` (objects it touches, raw shapes
+/// wholly inside) are selected.
 /// How many pieces it cut, each piece with the shape it came from, and the pieces inside.
 fn marquee_layer(s: &mut Session, r: &Rect, mut picked: Vec<ElementId>, partial: &[ElementId]) -> Result<(usize, CutOrigin, Vec<ElementId>)> {
     let here = s.layer;

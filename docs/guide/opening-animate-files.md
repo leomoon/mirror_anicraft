@@ -12,8 +12,8 @@ structure and from observation. On a Mac, read **⌘** wherever this chapter say
 
 1. Choose **File › Open…** (**Ctrl+O**, **⌘O** on macOS).
 2. Pick a `.fla` file, or the `.xfl` file inside an XFL folder.
-3. AniCraft opens it as a new, untitled document, and the status bar says what came across and
-   what didn't.
+3. AniCraft opens it as a new document named after the file, and the status bar says what came
+   across and what didn't.
 
 Other ways in:
 
@@ -31,9 +31,12 @@ folder can't be opened there.
 
 ## Saving: your Animate file is never touched
 
-An opened Animate file comes in **untitled**. When you save, AniCraft asks for a new name and
-writes an `.anicraft` document, so the original `.fla` or XFL is never overwritten. The status
-bar reminds you: "Save to keep it as an AniCraft document."
+An opened Animate file keeps its name on its tab and in the window title, marked
+**Imported**, but it has no AniCraft file yet. When you save, AniCraft asks for a new name,
+suggesting one beside the original (`walk.fla` suggests `walk.anicraft` in the same folder),
+and writes an `.anicraft` document, so the original `.fla` or XFL is never overwritten. The
+status bar reminds you: "Save to keep it as an AniCraft document." Once saved, the tab shows
+the `.anicraft` name. Hover over an imported tab to see which file it came from.
 
 AniCraft doesn't save back to `.fla` or XFL.
 
@@ -91,6 +94,10 @@ These come across, but look a little different from Animate, and the report coun
 
 * gradient and bitmap strokes (drawn in one colour);
 * ragged, stipple and hatched strokes (drawn solid);
+* strokes of a kind AniCraft doesn't know (drawn solid, with their weight and colour): a newer
+  version's brush or line style comes across as a plain line, not as nothing;
+* fills with a gap in their outline (closed straight across). If an area looks filled in that
+  wasn't, this line says which import to look at;
 * reverse loop modes (played forward) and extra spins on classic tweens (turned the shortest
   way);
 * in text: justified text (drawn left-aligned), first-line indents, superscript and subscript,
@@ -101,9 +108,12 @@ These come across, but look a little different from Animate, and the report coun
 ### Left out, for now
 
 * **Motion tweens** come across as keyframes, without their property curves or motion path.
-* **Bitmaps and sounds stored only in Animate's own internal format.** Animate keeps some media
-  in an undocumented form; those are listed, by name for sounds, instead of guessed at. Media
-  kept as PNG, JPEG, WAV, Ogg or MP3 comes across.
+* **Rare forms of Animate's own media storage.** Animate often keeps a library image or sound
+  only in its own data format. Lossless bitmaps and uncompressed 16-bit sounds in that format
+  come across, like media kept as PNG, JPEG, WAV, Ogg or MP3. Forms not yet seen in real files
+  (other pixel formats, uncompressed or JPEG-backed bitmaps, compressed or 8-bit sounds) are
+  listed by name, with why, instead of guessed at. AniCraft opens up to 256 million pixels of
+  images from one file, whatever their format; bitmaps beyond it are named in the report.
 * Sounds in formats AniCraft doesn't decode (AIFF, compressed WAV such as ADPCM, FLAC, AAC);
   convert them to WAV, Ogg or MP3 and import them again (**File › Import › Import to
   Library**).
@@ -111,8 +121,14 @@ These come across, but look a little different from Animate, and the report coun
   (played without an effect).
 * **Video playback.** Videos other than Screen Video (Sorenson H.263, On2 VP6, H.264, linked
   MPEG-4 files) are named in the report, not shown; their instances are left out.
-* Frame comments, filters on text, and linkage classes on bitmaps and sounds.
+* Frame comments, and linkage classes on bitmaps and sounds.
+* **Parts of a drawing AniCraft can't read**: "outline parts AniCraft couldn't read" (the rest
+  of that outline is drawn), fills of a kind AniCraft doesn't know, and lines or fills in a
+  style their shape doesn't have. If lines are missing after opening a file, these counts say
+  why; please include the report when you tell us.
 * Camera layers and bone armatures don't come across as a camera or an armature.
+* **Layer parenting** doesn't come across: parented layers open as plain layers. Parent them
+  again in the timeline's [parenting view](timeline.md#layer-parenting).
 * Anything AniCraft doesn't recognise at all is counted as "other elements".
 
 ## Fonts
@@ -125,11 +141,29 @@ again to see the text as designed.
 Once you save, the `.anicraft` document keeps the letter shapes, so it looks the same on
 computers without the font.
 
+## Flash 8 to CS4 files
+
+A `.fla` saved by **Flash 8, CS3 or CS4** uses an older, binary format. AniCraft opens it like
+any other Animate file, untitled, so saving asks for a new `.anicraft` name.
+
+* **What comes across**: scenes, layers and layer folders, keyframes and their timing, shapes
+  with their curves, gradients and strokes (dashed and dotted ones with their pattern), groups,
+  symbol instances (transform, loop mode, first frame, colour effect), classic and shape tweens
+  with their eases and shape hints, static and dynamic text, bitmaps, sounds on frames, button
+  names, Library folders, and the stage size and frame rate.
+* **Frame scripts** are kept exactly as written, but don't run in Test Movie.
+* **Not yet**: filters, movie clip component settings and bitmap fills are left out, and
+  ragged, stipple and hatched strokes are drawn solid. An instance with filters also loses its blend mode and is
+  drawn as Normal. The report names each of them.
+
 ## Old, damaged and unusual files
 
-* A `.fla` saved by **Flash CS4 or earlier** uses an older format AniCraft can't read. AniCraft
-  says so: open it in Animate and save it again, then open that copy.
+* A `.fla` saved by **Flash MX 2004 or earlier**, or by a version AniCraft doesn't read, can't
+  be opened yet. AniCraft says so: open it in Animate (or Flash 8 to CS4) and save it again,
+  then open that copy.
 * A renamed `.fla` still opens; AniCraft recognises it by what is inside.
+* Flash and Animate write most `.fla` files with a small slip in the archive's closing record
+  (it overstates the size of the file list). AniCraft opens them as Animate does.
 * Archives made by different zip tools open, large ones included: a zipped XFL folder (the
   document inside one top folder, with or without the `__MACOSX` folder macOS adds), and a
   self-extracting archive renamed to `.fla`. A zip holding several documents in their own

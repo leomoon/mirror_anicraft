@@ -18,16 +18,46 @@ On macOS, press ⌘ where this guide says Ctrl, and ⌥ where it says Alt.
 * **Linux**: the deb and rpm packages install it as `/usr/bin/anicraft-cli`; the tarball has it
   next to `anicraft`.
 
-Run it with no arguments, or with `--help`, to see every subcommand. `anicraft-cli --version`
-prints the version.
+Run it with `--help` to see every subcommand, and `<subcommand> --help` for one. `anicraft-cli
+--version` (or `-V`) prints the version, and so does `-V` after any subcommand. The Linux
+packages install a man page for each subcommand (`man anicraft-cli-render`) and completions for
+bash, zsh and fish.
 
-Two rules hold everywhere:
+These rules hold everywhere:
 
-* Each subcommand takes a document path, or `--sample` for the built-in sample animation. The
-  positional document must be a `.anicraft` file (to work on an Animate file, see
-  [Converting Animate files](#converting-animate-files)).
+* Subcommands that open a document accept a `.anicraft` file, an Animate `.fla` or `.xfl`
+  file, an XFL folder, or `--sample` for the built-in sample animation. See
+  [Converting Animate files](#converting-animate-files) to save an import as `.anicraft`.
 * **Frame flags on the command line are 1-based**, as on the timeline: `--frame 1` is the first
   frame. Frame numbers inside JSON params are 0-based, as everywhere in the engine.
+* **The exit code says what went wrong**: 0 for success, 1 when a command ran and failed, 2 for
+  a command line that is wrong, and 128 plus the signal number for a process ended by a signal
+  (130 for Ctrl+C), as in the shell. Results go to standard output and `error: …` messages to
+  standard error.
+* **A command line that is wrong is an error before anything is opened or written**, with exit
+  code 2 and the subcommand's usage: a flag the subcommand doesn't take, a flag given twice, a
+  value that isn't a number where one is needed, JSON that doesn't parse, or flags that
+  conflict. A mistyped `--frmae 12` never renders frame 1 as if you had asked for it. A value
+  that starts with `-` is written `--out=-image.png`.
+* **Nothing is replaced by accident.** An output that would replace the document it was made
+  from is refused, and `run` and `exec` save onto the document they opened only with
+  `--in-place`. See [Replacing files](#replacing-files).
+* **`--plugins <folder>`**, also read from the `ANICRAFT_PLUGINS` environment variable when the
+  flag is not given (a blank variable counts as unset), loads WebAssembly plug-ins first. No
+  other environment variable sets an option, and none can turn on a flag that overwrites.
+
+### RFC-0018
+
+The command-line tool follows
+[RFC-0018, command-line conventions](https://github.com/storytold/craft-contrib/blob/main/rfcs/0018-cli-conventions.md).
+Its help is the reference for every flag, as the rule asks; this page is the guide. What it
+does not meet yet:
+
+* `serve`, `mcp` and the control channel report an error to the assistant as text inside their
+  protocol, not as a typed error.
+* The ast-grep rules and the `AGENTS.md` line that asks agents to run them wait for the shared
+  workflow in craft-common-actions.
+* macOS and Windows have no man pages or completions (the RFC leaves them out).
 
 ## Rendering
 
@@ -36,14 +66,20 @@ Two rules hold everywhere:
 | `info <file>` | A JSON description of the document: stage, scenes, layers, keyframes, library. |
 | `render <file> --out frame.png [--frame N] [--scale S]` | One frame as a PNG. |
 | `render-seq <file> --out-dir dir [--from A] [--to B] [--scale S]` | A numbered PNG sequence. |
-| `gif <file> --out anim.gif [--from A] [--to B] [--scale S] [--overwrite yes]` | An animated GIF. |
+| `gif <file> --out anim.gif [--from A] [--to B] [--scale S] [--overwrite]` | An animated GIF. |
 | `apng <file> --out anim.png [...]` | An animated PNG, full colour with real transparency. |
 | `webp <file> --out anim.webp [...]` | A lossless animated WebP. |
+| `formats` | A JSON list of available export formats and their IDs. |
+| `export <file> --format ID --out PATH` | A built-in or plug-in export, selected by format ID. |
 | `new --out file.anicraft [--width W] [--height H] [--fps F]` | A new, empty document. |
 
 `apng` and `webp` take the same range and scale flags as `gif`, plus `--loop forever` (the
-default) or `--loop N` for how many times it plays, and `--background yes` to draw the stage
+default) or `--loop N` for how many times it plays, and `--background` to draw the stage
 colour instead of transparency.
+
+Use the `id` from `formats` with `export --format`. To use an exporter plug-in, pass the
+same `--plugins <folder>` to both commands. For PNG and SVG, `export --frame N` selects a
+frame using the same 1-based numbering as `render`.
 
 Every frame is drawn by the same renderer the app uses for its exports, so what you render here
 matches File › Export exactly.
@@ -53,18 +89,26 @@ anicraft-cli render shot010.anicraft --frame 24 --out shot010_f24.png
 anicraft-cli render-seq shot010.anicraft --out-dir frames/shot010 --scale 0.5
 anicraft-cli gif --sample --out preview.gif --scale 0.5
 anicraft-cli webp shot010.anicraft --out loop.webp --loop 3
+anicraft-cli export --sample --format svg --frame 1 --out preview.svg
 ```
 
 ### Replacing files
 
 Exports never overwrite a file silently. If the output already exists, the command fails and
-says so ("Replace existing file? f.png already exists…"). Pass `--overwrite yes` to `gif`,
-`apng` and `webp` when replacing is what you want. `render` has no such flag: delete the old file
-first, or run the export command itself with `"confirm": true` (see
-[Destructive commands need "confirm"](#destructive-commands-need-confirm)):
+says so ("Replace existing file? f.png already exists…"). Pass `--overwrite` (`--overwrite yes`
+works too) to `gif`, `apng`, `webp` or `export` when you want to replace it. To replace a PNG,
+use `export` with the `png` format:
 
 ```sh
-anicraft-cli exec shot010.anicraft file.export_png '{"path":"f24.png","frame":23,"confirm":true}'
+anicraft-cli export shot010.anicraft --format png --frame 24 --out f24.png --overwrite
+```
+
+An export never replaces the document it renders, and `--overwrite` doesn't change that.
+`run` and `exec` write a document with `--save`; saving onto the document they opened replaces
+it, so that needs `--in-place`:
+
+```sh
+anicraft-cli run shot010.anicraft title.json --save shot010.anicraft --in-place
 ```
 
 ## Running any command
@@ -121,6 +165,22 @@ anicraft-cli run shot010.anicraft title.json --save shot010_titled.anicraft
 Steps run in order. The first one that fails stops the run, and the error names the step. The
 results of all the steps print as a JSON array.
 
+### A chart from numbers
+
+Tables of numbers can drive instances (see [Data-driven animation](data-driven-animation.md)).
+This script gives a document a table and lets one of its columns set the height of the selected
+bar, frame by frame:
+
+```json
+[
+  {"cmd": "data.set_table", "params": {"name": "Rainfall", "columns": [{"name": "Jan", "values": [40, 85, 120, 96]}]}},
+  {"cmd": "data.bind", "params": {"property": "scale_y", "table": "Rainfall", "column": "Jan", "frames": 24}}
+]
+```
+
+`data.import_table` reads the numbers from a CSV, TSV or JSON file instead, and importing a
+table that is already there replaces its values and keeps what is bound to it.
+
 ### Publishing a document
 
 If a document has **File › Publish Settings** set up, one command writes every format it has
@@ -159,8 +219,13 @@ Renders are deterministic: the same document and flags give the same pixels on e
 
 ### Converting Animate files
 
-The positional document must be a `.anicraft` file, but the `file.open` command reads `.fla`,
-`.xfl` and XFL folders. Start from the sample, open the Animate file over it, and save:
+Pass a `.fla`, `.xfl` file or XFL folder directly to any subcommand that opens a document:
+
+```sh
+anicraft-cli info intro.fla
+```
+
+To save an import as `.anicraft` and print its import report, use `file.open` and `--save`:
 
 ```sh
 anicraft-cli exec --sample file.open '{"path":"intro.fla"}' --save intro.anicraft
@@ -217,16 +282,26 @@ it: they can be undone with `edit.undo` in the same session.
 then open a document, draw, animate, look at frames and export, through the same commands the
 app uses.
 
+You say which folders the assistant may use. `mcp` does not start without both:
+
+* `--automation-read-root <folder>`: its commands may read files inside this folder (open,
+  import). Give it again for more folders.
+* `--automation-write-root <folder>`: its commands may save and export inside this folder.
+
+They can be the same folder, and each must already exist.
+
 ```sh
-anicraft-cli mcp                    # a new, empty document
-anicraft-cli mcp scene.anicraft     # open a document
-anicraft-cli mcp --sample           # the sample animation
+ROOTS="--automation-read-root /work/project --automation-write-root /work/project"
+anicraft-cli mcp $ROOTS                   # a new, empty document
+anicraft-cli mcp scene.anicraft $ROOTS    # open a document
+anicraft-cli mcp --sample $ROOTS          # the sample animation
 ```
 
 To register it with Claude Code:
 
 ```sh
-claude mcp add anicraft -- /path/to/anicraft-cli mcp
+claude mcp add anicraft -- /path/to/anicraft-cli mcp \
+  --automation-read-root /work/project --automation-write-root /work/project
 ```
 
 Most other clients take an entry like this (use the full path to `anicraft-cli`):
@@ -236,7 +311,9 @@ Most other clients take an entry like this (use the full path to `anicraft-cli`)
   "mcpServers": {
     "anicraft": {
       "command": "/path/to/anicraft-cli",
-      "args": ["mcp", "/path/to/scene.anicraft"]
+      "args": ["mcp", "/work/project/scene.anicraft",
+               "--automation-read-root", "/work/project",
+               "--automation-write-root", "/work/project"]
     }
   }
 }
@@ -257,10 +334,36 @@ Things to know:
 * Every edit is checked and can be undone, as in the app.
 * Commands that would lose work or replace a file still need `"confirm": true`. The server tells
   the assistant to check with you before confirming.
-* The assistant reads and writes files with your permissions, at the paths it chooses. Only
-  connect assistants you trust with those files.
+* The assistant's commands read files only inside the read root and write only inside the write
+  root. Anything else is refused before a file is touched, with a message that names the root.
+  The path is checked as the file it really is: `..`, shortcuts to other folders (symbolic
+  links, junctions) and, on Windows, capital letters make no difference. Inside the roots the
+  assistant has your permissions, so give it a project folder, not your home folder.
+* The document you name when starting the server opens wherever it is. If it is outside the
+  write root, the assistant can't save over it: it saves a copy inside the write root
+  (`file.save_as`).
 * The server works on its own copy of the document, not on the window you have open. Save from
-  the assistant, then open the file in AniCraft.
+  the assistant, then open the file in AniCraft. To have the assistant work in the window
+  instead, see the next section.
+
+### An assistant in the window you have open
+
+Start AniCraft with `anicraft --control 9878`, and give the assistant
+`anicraft-cli mcp --bridge 9878` (with the same two `--automation-…-root` flags) as its server
+instead. The same five
+tools then act on the document in front of you: each edit shows at once and undoes with
+**Ctrl+Z** like your own. While this is on, the status bar says **Remote control on (port
+9878)**.
+
+* Only programs on this computer, running as you, can connect: the port is not open to the
+  network, and each run has its own secret token, kept in the settings folder until AniCraft
+  closes.
+* An edit from the assistant waits while you are in the middle of a drag, so your undo steps
+  and its own never mix.
+* Commands that would lose work still need `"confirm": true`, as above.
+* The two folders apply here too, to the assistant's commands only: your own work in the window
+  is not limited.
+* Without `--control` nothing listens: remote control is off unless you start AniCraft this way.
 
 The full details are in
 [the MCP notes on GitHub](https://github.com/storytold/AniCraft/blob/main/docs/mcp.md).
@@ -273,6 +376,17 @@ pictures, so you can read it offline or host it next to your studio's own docume
 ```sh
 anicraft-cli guide --out docs/anicraft-guide
 ```
+
+`anicraft-cli guide search <words>` searches it from the terminal, with the same results, in the
+same order, as the search field in the guide's pages:
+
+```sh
+anicraft-cli guide search onion skin
+anicraft-cli guide search export gif --limit 3 --json
+```
+
+Each result gives the section's heading, its chapter, the page to open and a passage around the
+first match. See [Using this guide](using-this-guide.md).
 
 ## Performance check
 

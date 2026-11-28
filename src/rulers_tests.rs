@@ -24,6 +24,34 @@ fn app() -> (egui::Context, App) {
     (ctx, app)
 }
 
+/// ADR 0128: a frame too large to draw in full is drawn in part, and the status bar says so
+/// once, as an error that stays; going to a frame that is whole and back says it again.
+#[test]
+fn a_frame_with_artwork_left_out_says_so_in_the_status_bar() {
+    let mut large = sample::doubling(31);
+    // Thousands of empty layers in every symbol: the allowance goes on looking at them, so
+    // the frame is cut short with little to draw.
+    for sym in &mut large.library {
+        let tl = &mut std::sync::Arc::make_mut(sym).timeline;
+        for i in 0..5_000 {
+            tl.layers.push(std::sync::Arc::new(anicraft_engine::doc::Layer::new(anicraft_engine::doc::LayerId(9_000 + i), "empty")));
+        }
+    }
+    let ctx = egui::Context::default();
+    let mut big = App::with_context(&ctx, Session::new(large), Some(std::path::PathBuf::from("unused.png")));
+    frame(&ctx, &mut big, vec![]);
+    let said = big.status.as_ref().map(|s| (s.text.clone(), s.error));
+    assert!(said.as_ref().is_some_and(|(text, error)| *error && text.contains("left out")), "{said:?}");
+    // Said once: a later message is not written over while the frame stays as it is.
+    big.status_ok("something else");
+    frame(&ctx, &mut big, vec![]);
+    assert_eq!(big.status.as_ref().map(|s| s.text.as_str()), Some("something else"));
+    // An ordinary document says nothing.
+    let (ctx, mut app) = app();
+    frame(&ctx, &mut app, vec![]);
+    assert!(!app.status.as_ref().is_some_and(|s| s.text.contains("left out")));
+}
+
 fn press(p: Pos2, pressed: bool) -> Event {
     Event::PointerButton { pos: p, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE }
 }
@@ -107,10 +135,13 @@ fn drawing_and_free_transform_snap_to_guides() {
     }
     let g = canvas(&app);
     let screen_of = |x: f32, y: f32| pos2(g.origin.x + x * g.zoom, g.origin.y + y * g.zoom);
-    // Grabbed by the middle, so the box's centre is what snaps; let go 3 screen pixels short.
+    // Grabbed near the middle, so the box's centre is what snaps; let go 3 screen pixels short.
+    // (Not on the very centre: the transformation point is there, and a drag on it moves the
+    // point, not the box; ADR 0111. Nor far from it: the box is under 40 screen pixels tall
+    // with the document tabs above the stage, and its lower edge's handle is 20 below.)
     let sel = app.s.selection_bounds();
     let cx = (sel.min.x + sel.max.x) * 0.5;
-    let inside = screen_of(cx, (sel.min.y + sel.max.y) * 0.5);
+    let inside = screen_of(cx, (sel.min.y + sel.max.y) * 0.5) + vec2(0.0, 9.0);
     let dx = (500.0 - cx) * g.zoom - 3.0;
     drag(&ctx, &mut app, inside, inside + vec2(dx, 0.0));
     let after = app.s.selection_bounds();

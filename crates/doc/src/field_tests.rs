@@ -2,7 +2,7 @@ use super::*;
 use crate::{Rgba, TextAlign};
 
 fn block(text: &str, f: TextField) -> TextBlock {
-    TextBlock { text: text.into(), font: "Mono".into(), size: 10.0, bold: false, italic: false, color: Rgba::BLACK, align: TextAlign::Left, letter_spacing: 0.0, line_spacing: 0.0, width: None, outline: Arc::new(Path::new()), box_width: 54.0, box_height: 24.0, field: Some(f), on_path: None }
+    TextBlock { text: text.into(), font: "Mono".into(), size: 10.0, bold: false, italic: false, color: Rgba::BLACK, align: TextAlign::Left, letter_spacing: 0.0, line_spacing: 0.0, width: None, outline: Arc::new(Path::new()), box_width: 54.0, box_height: 24.0, field: Some(f), on_path: None, ..Default::default() }
 }
 
 /// Runs edits on a field as the player does: each change of text lays it out again (10 px per
@@ -179,4 +179,112 @@ fn script_text_is_capped_and_takes_actionscript_line_ends() {
     assert_eq!(slice("héllo", 1, 3), "él");
     assert_eq!(slice("héllo", 4, 99), "o");
     assert_eq!(byte_at("héllo", 2), 3);
+}
+
+#[test]
+fn restrict_reads_as_actionscript_writes_it() {
+    let ok = |r: &str, s: &str| s.chars().filter(|c| allowed(r, *c)).collect::<String>();
+    assert_eq!(ok("A-Z 0-9", "Ab 9-z"), "A 9");
+    assert_eq!(ok("^a-z", "aBc1"), "B1", "everything but lower case");
+    assert_eq!(ok("A-Z^Q", "PQR"), "PR", "capitals, but not Q");
+    assert_eq!(ok("^a-z^m", "almz"), "m", "excluded, then let back in");
+    assert_eq!(ok("0-9\\-", "1-2a"), "1-2", "an escaped hyphen is a character");
+    assert_eq!(ok("\\^\\\\", "^\\a"), "^\\");
+    assert_eq!(ok("", "abc"), "", "an empty list allows nothing");
+    assert_eq!(ok("abc-", "a-c"), "a-c", "a trailing hyphen is itself");
+    assert_eq!(ok("z-a", "amz"), "", "a backwards range holds nothing");
+    assert_eq!(ok("é-ü😀", "é😀a"), "é😀");
+    // Long and odd lists are read without trouble.
+    assert!(!allowed(&"^".repeat(5000), 'a') || allowed(&"^".repeat(5000), 'a'));
+    assert!(allowed(&"\\".repeat(1023), '\\'));
+}
+
+
+// Text that mixes directions (ADR 0130). Looks are written by hand, as the layout hands them
+// over: every character 10 wide, capitals reading right to left.
+
+fn cell(start: u32, x0: f32, rtl: bool) -> CaretBox {
+    CaretBox { start, end: start + 1, x0, x1: x0 + 10.0, rtl }
+}
+
+fn look_of(lines: Vec<CaretLine>) -> FieldLook {
+    let n = lines.len() as f32;
+    FieldLook { outline: Arc::new(Path::new()), pieces: Arc::from(Vec::new()), lines: lines.into(), line_height: 10.0, width: 50.0, height: n * 10.0 }
+}
+
+/// "abCDE" in a left-to-right paragraph, displayed a b E D C.
+fn word_in_latin() -> FieldLook {
+    let boxes = vec![cell(0, 0.0, false), cell(1, 10.0, false), cell(4, 20.0, true), cell(3, 30.0, true), cell(2, 40.0, true)];
+    look_of(vec![CaretLine { start: 0, end: 5, stops: vec![(0, 0.0), (1, 10.0), (2, 50.0), (3, 40.0), (4, 30.0), (5, 20.0)], rtl: false, boxes }])
+}
+
+/// "AB CD" in a right-to-left paragraph wrapped after the space: B A on the first line, D C on
+/// the second, each starting at its right end.
+fn wrapped_rtl() -> FieldLook {
+    let first = CaretLine { start: 0, end: 3, stops: vec![(0, 20.0), (1, 10.0), (2, 0.0), (3, 0.0)], rtl: true, boxes: vec![cell(1, 0.0, true), cell(0, 10.0, true)] };
+    let second = CaretLine { start: 3, end: 5, stops: vec![(3, 20.0), (4, 10.0), (5, 0.0)], rtl: true, boxes: vec![cell(4, 0.0, true), cell(3, 10.0, true)] };
+    look_of(vec![first, second])
+}
+
+/// The carets a key visits from `from`, pressed `n` times.
+fn walk(text: &str, look: &FieldLook, from: u32, key: Edit, n: usize) -> Vec<u32> {
+    let field = TextField { lines: LineType::Multiline, ..TextField::new(TextKind::Input) };
+    let b = block(text, field.clone());
+    let mut st = FieldState { caret: from, anchor: from, ..FieldState::default() };
+    (0..n)
+        .map(|_| {
+            Editor { block: &b, field: &field, st: &mut st }.key(key, false, Some(look));
+            st.caret
+        })
+        .collect()
+}
+
+#[test]
+fn arrows_move_the_caret_the_way_they_point_through_a_right_to_left_word() {
+    let look = word_in_latin();
+    // Right from the start: past a and b, then through the word from its left (its end) to
+    // its right (its start), where the line ends.
+    assert_eq!(walk("abCDE", &look, 0, Edit::Right, 6), vec![1, 5, 4, 3, 2, 2]);
+    assert_eq!(walk("abCDE", &look, 2, Edit::Left, 6), vec![3, 4, 5, 1, 0, 0]);
+    // Each press moves the caret further the way the key points.
+    let xs: Vec<f32> = [0, 1, 5, 4, 3, 2].iter().map(|i| look.caret_at(*i).x).collect();
+    assert!(xs.windows(2).all(|w| w[0] < w[1]), "{xs:?}");
+    // Shift keeps the anchor: the selection is still a range of characters.
+    let field = TextField::new(TextKind::Input);
+    let b = block("abCDE", field.clone());
+    let mut st = FieldState { caret: 1, anchor: 1, ..FieldState::default() };
+    Editor { block: &b, field: &field, st: &mut st }.key(Edit::Right, true, Some(&look));
+    assert_eq!(st.selection(), (1, 5));
+    // A line that reads left to right throughout moves by characters, as it always has.
+    assert_eq!(mono_look("abc", 10.0, 10.0, None).step(1, true), None);
+}
+
+#[test]
+fn arrows_cross_lines_in_the_paragraphs_direction() {
+    let look = wrapped_rtl();
+    // Left reads on in a right-to-left paragraph: to the line's left end, then the next line's
+    // right end. The wrapped line's end is the next line's start, shown there.
+    assert_eq!(walk("AB CD", &look, 0, Edit::Left, 6), vec![1, 2, 3, 4, 5, 5]);
+    assert_eq!(walk("AB CD", &look, 5, Edit::Right, 6), vec![4, 3, 2, 1, 0, 0]);
+    assert_eq!((look.caret_at(3), look.caret_at(2)), (Vec2::new(20.0, 10.0), Vec2::new(0.0, 0.0)));
+    // Home is where the line starts and End where it ends, whichever side that is.
+    assert_eq!(walk("AB CD", &look, 4, Edit::Home, 1), vec![3]);
+    assert_eq!(look.lines[1].x_at(3), 20.0);
+}
+
+#[test]
+fn a_selection_across_directions_is_highlighted_in_stretches() {
+    let look = word_in_latin();
+    let line = &look.lines[0];
+    assert_eq!(line.spans(0, 2), vec![(0.0, 20.0)]);
+    assert_eq!(line.spans(2, 5), vec![(20.0, 50.0)], "the whole word");
+    // b and the word's first two letters (C and D, its rightmost): two stretches.
+    assert_eq!(line.spans(1, 4), vec![(10.0, 20.0), (30.0, 50.0)]);
+    assert_eq!(line.spans(0, 9), vec![(0.0, 50.0)]);
+    assert_eq!(line.spans(3, 3), Vec::new());
+    assert_eq!(line.spans(7, 9), Vec::new());
+    // Without boxes (text in one direction): from one caret place to the other.
+    let plain = mono_look("abcd", 10.0, 10.0, None);
+    assert_eq!(plain.lines[0].spans(1, 3), vec![(10.0, 30.0)]);
+    assert!(!plain.lines[0].mixed() && line.mixed() && wrapped_rtl().lines[0].mixed());
 }

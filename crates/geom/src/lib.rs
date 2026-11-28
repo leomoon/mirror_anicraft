@@ -10,7 +10,9 @@ pub mod clip;
 pub mod edit;
 pub mod envelope;
 pub mod morph;
+pub mod outline;
 pub mod planar;
+pub mod polygons;
 pub mod pressure;
 pub mod raw;
 pub mod slice;
@@ -21,7 +23,7 @@ pub mod trace;
 pub mod walk;
 
 pub use affine::{Affine, Decomposed};
-pub use fit::fit_curve;
+pub use fit::{fit_curve, fit_curve_with};
 pub use path::{FillRule, POLYSTAR_MAX_SIDES, Path, PathCmd, Polyline, polystar_corners, segment_distance, star_inner_radius};
 
 use serde::{Deserialize, Serialize};
@@ -46,8 +48,13 @@ impl Vec2 {
     pub fn cross(self, o: Vec2) -> f32 {
         self.x * o.y - self.y * o.x
     }
+    /// Exact wherever the true length is a finite `f32`. The squares leave `f32` for components
+    /// past about 1.8e19 (or below 1e-19), so only then is the slower `hypot` taken: in range
+    /// the result is the multiply's, bit for bit, at its cost (0.85 ns against 0.83 ns; `hypot`
+    /// alone is 1.9 ns, and this is on the flattening and stroking paths).
     pub fn length(self) -> f32 {
-        self.dot(self).sqrt()
+        let sq = self.dot(self);
+        if sq.is_normal() { sq.sqrt() } else { self.x.hypot(self.y) }
     }
     pub fn normalized(self) -> Vec2 {
         let l = self.length();
@@ -169,9 +176,51 @@ pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
+/// Geometric interpolation of scalars: `a · (b / a)^t`, the straight line between them on a
+/// logarithmic scale, so equal steps of `t` multiply by equal factors. Two scale axes moved
+/// this way keep the product of their ends on the way (ADR 0115). It needs both ends on the
+/// same side of zero; ends that differ in sign, a zero end or anything not finite fall back
+/// to [`lerp`]. Exactly `a` at 0 and `b` at 1; outside 0..=1 it goes on in the same ratio and
+/// never crosses zero.
+pub fn lerp_geometric(a: f32, b: f32, t: f32) -> f32 {
+    if t == 0.0 {
+        return a;
+    }
+    if t == 1.0 {
+        return b;
+    }
+    if a.is_finite() && b.is_finite() && t.is_finite() && a * b > 0.0 {
+        let v = a * (b / a).powf(t);
+        if v.is_finite() {
+            return v;
+        }
+    }
+    lerp(a, b, t)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn geometric_lerp_keeps_the_product_of_two_axes() {
+        // 100 % x 100 % to 200 % x 50 %: the halfway frame is about 141 % x 71 %.
+        let (x, y) = (lerp_geometric(1.0, 2.0, 0.5), lerp_geometric(1.0, 0.5, 0.5));
+        assert!((x - std::f32::consts::SQRT_2).abs() < 1e-6 && (y - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6, "{x} {y}");
+        for i in -10..=20 {
+            let t = i as f32 / 10.0;
+            let p = lerp_geometric(3.0, 0.75, t) * lerp_geometric(0.5, 2.0, t);
+            assert!((p - 1.5).abs() < 1e-5, "t {t}: {p}");
+        }
+        // The ends exactly; a flipped axis keeps its sign.
+        assert_eq!((lerp_geometric(3.0, 7.0, 0.0), lerp_geometric(3.0, 7.0, 1.0)), (3.0, 7.0));
+        assert!((lerp_geometric(-1.0, -4.0, 0.5) + 2.0).abs() < 1e-6);
+        // Through zero, from zero, or not finite: the straight line.
+        assert_eq!(lerp_geometric(-1.0, 1.0, 0.25), lerp(-1.0, 1.0, 0.25));
+        assert_eq!(lerp_geometric(0.0, 2.0, 0.5), 1.0);
+        assert!(lerp_geometric(1.0, f32::INFINITY, 0.5).is_infinite());
+        assert!(lerp_geometric(1e-30, 1e30, 5.0).is_finite());
+    }
 
     #[test]
     fn flat_rects_transform_and_empty_ones_stay_empty() {
@@ -199,5 +248,18 @@ mod tests {
         assert_eq!(v.length(), 5.0);
         assert_eq!(v.perp().dot(v), 0.0);
         assert_eq!(Vec2::ZERO.normalized(), Vec2::ZERO);
+    }
+
+    #[test]
+    fn length_and_normalized_survive_huge_components() {
+        let v = Vec2::new(3e19, 4e19);
+        assert!((v.length() / 5e19 - 1.0).abs() < 1e-5, "len {}", v.length());
+        let n = v.normalized();
+        assert!((n.x - 0.6).abs() < 1e-5 && (n.y - 0.8).abs() < 1e-5, "{n:?}");
+        // Squares too small for `f32` no longer read as no length at all.
+        let tiny = Vec2::new(3e-30, 4e-30).length();
+        assert!((tiny / 5e-30 - 1.0).abs() < 1e-5, "len {tiny}");
+        assert_eq!(Vec2::ZERO.length(), 0.0);
+        assert!(Vec2::new(f32::NAN, 1.0).length().is_nan());
     }
 }

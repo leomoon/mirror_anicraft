@@ -12,7 +12,7 @@
 use anicraft_doc::actions::as3::Problem;
 use anicraft_doc::actions::{Action, CompileResult, FrameScript, MAX_ACTIONS, PluginScript, check_actions};
 use anicraft_doc::player::{Event, Node, NodeKind, PlayerState, ScriptContext, ScriptHost, ScriptRun, Step, TimelineRef};
-use anicraft_doc::field::{CaretLine, FieldLook};
+use anicraft_doc::field::{CaretBox, CaretLine, FieldLook};
 use anicraft_doc::{Document, LayerKind, SymbolKind, TextBlock, Timeline, player};
 use anicraft_geom::Vec2;
 use anicraft_plugins::{Host, Kind, Limits, Registry};
@@ -94,21 +94,28 @@ impl ScriptHost for ScriptRunner<'_> {
         }
     }
 
-    fn lay_out_field(&mut self, block: &TextBlock, shown: &str) -> Option<FieldLook> {
-        field_look(block, shown)
+    fn lay_out_field(&mut self, block: &TextBlock, shown: &str, rich: Option<&anicraft_doc::html_text::RichStyles>) -> Option<FieldLook> {
+        field_look(block, shown, rich)
     }
 }
 
 /// A field's text laid out with this computer's fonts, as the player draws and edits it
 /// (ADR 0066).
-pub fn field_look(block: &TextBlock, shown: &str) -> Option<FieldLook> {
+pub fn field_look(block: &TextBlock, shown: &str, rich: Option<&anicraft_doc::html_text::RichStyles>) -> Option<FieldLook> {
     let f = block.field.as_ref()?;
-    let l = crate::cmds_text::field_layout(anicraft_text::Fonts::get(), &crate::cmds_text::style_of(block), f, block.box_width, shown).ok()?;
-    let mut lines: Vec<CaretLine> = l.carets.into_iter().map(|c| CaretLine { start: c.start, end: c.end, stops: c.stops }).collect();
+    let fonts = anicraft_text::Fonts::get();
+    // Styled text (`htmlText`, ADR 0107) is laid out run by run, one piece per colour.
+    let (l, colors) = match rich {
+        Some(r) => crate::cmds_text::field_layout_rich(fonts, block, f, shown, r).ok()?,
+        None => (crate::cmds_text::field_layout(fonts, &crate::cmds_text::style_of(block), f, block.box_width, shown).ok()?, Vec::new()),
+    };
+    let pieces: Vec<(anicraft_doc::Rgba, std::sync::Arc<anicraft_geom::Path>)> = if colors.len() > 1 || colors.first().is_some_and(|c| *c != block.color) { l.pieces.iter().filter_map(|(k, p)| Some((*colors.get(*k as usize)?, std::sync::Arc::new(p.clone())))).collect() } else { Vec::new() };
+    let boxes = |c: &anicraft_text::CaretLine| c.boxes.iter().map(|b| CaretBox { start: b.start, end: b.end, x0: b.x0, x1: b.x1, rtl: b.rtl }).collect();
+    let mut lines: Vec<CaretLine> = l.carets.into_iter().map(|c| CaretLine { start: c.start, end: c.end, rtl: c.rtl, boxes: boxes(&c), stops: c.stops }).collect();
     if lines.is_empty() {
-        lines.push(CaretLine { start: 0, end: 0, stops: vec![(0, 0.0)] });
+        lines.push(CaretLine { start: 0, end: 0, stops: vec![(0, 0.0)], ..CaretLine::default() });
     }
-    Some(FieldLook { outline: std::sync::Arc::new(l.outline), lines: lines.into(), line_height: l.line_height, width: l.width, height: l.height })
+    Some(FieldLook { outline: std::sync::Arc::new(l.outline), pieces: pieces.into(), lines: lines.into(), line_height: l.line_height, width: l.width, height: l.height })
 }
 
 /// What a running frame script talks to.

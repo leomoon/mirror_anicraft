@@ -42,11 +42,6 @@ fn swatches(n: usize) -> String {
     if n == 1 { "1 swatch".into() } else { format!("{n} swatches") }
 }
 
-fn target_layer<'a>(s: &'a Session, p: &Value) -> Option<&'a Layer> {
-    let id = p.get("layer").and_then(Value::as_u64).map_or(s.layer, LayerId);
-    s.timeline().layer(id)
-}
-
 fn target_frame(s: &Session, p: &Value) -> u32 {
     p.get("frame").and_then(Value::as_u64).and_then(|f| u32::try_from(f).ok()).unwrap_or(s.frame)
 }
@@ -59,6 +54,8 @@ fn target_count(p: &Value) -> u32 {
 /// `(layer name, element count)`.
 fn lost_keys(s: &Session, p: &Value, hit: impl Fn(&Keyframe) -> bool) -> Vec<(String, usize)> {
     let ids: Vec<LayerId> = match p.get("layers").and_then(Value::as_array) {
+        // Every layer that reaches the frame (Shift+F5 and Shift+F6 with no frame selection).
+        _ if p.get("all_layers").and_then(Value::as_bool) == Some(true) => crate::cmds_timeline::layers_at_or_after(s, target_frame(s, p)),
         Some(v) => v.iter().filter_map(Value::as_u64).map(LayerId).take(1000).collect(),
         None => vec![p.get("layer").and_then(Value::as_u64).map_or(s.layer, LayerId)],
     };
@@ -113,6 +110,25 @@ pub fn confirmation(s: &Session, id: &str, p: &Value) -> Option<Confirmation> {
                 title: "Delete template?".into(),
                 message: format!("The template “{name}” and its picture will be deleted from your templates. This cannot be undone."),
                 action: "Delete Template".into(),
+                irreversible: true,
+            })
+        }
+        // Saved commands are files in your preferences (ADR 0097).
+        "macro.save" => {
+            let path = crate::cmds_macro::target(p).ok()?;
+            crate::vfs::exists(&path).then(|| overwrite(&path, "Saving the command"))
+        }
+        "macro.import" => {
+            let path = crate::cmds_macro::import_target(p).ok()?;
+            crate::vfs::exists(&path).then(|| overwrite(&path, "Adding the command"))
+        }
+        "macro.delete" => {
+            let path = crate::cmds_macro::target(p).ok()?;
+            let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            crate::vfs::is_file(&path).then(|| Confirmation {
+                title: "Delete saved command?".into(),
+                message: format!("The saved command “{name}” will be deleted from your commands. This cannot be undone."),
+                action: "Delete Command".into(),
                 irreversible: true,
             })
         }
@@ -223,11 +239,12 @@ pub fn confirmation(s: &Session, id: &str, p: &Value) -> Option<Confirmation> {
             let json = path.with_extension("json");
             [path, json.as_path()].into_iter().find(|f| crate::vfs::exists(f)).map(|f| overwrite(f, "Exporting"))
         }
-        "file.export_png_sequence" => {
+        "file.export_png_sequence" | "file.export_svg_sequence" => {
             let dir = Path::new(p.get("dir").and_then(Value::as_str)?);
+            let ext = if id == "file.export_svg_sequence" { ".svg" } else { ".png" };
             let has_frames = crate::vfs::list(dir, 10_000).iter().any(|e| {
                 let n = e.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-                n.starts_with("frame_") && n.ends_with(".png")
+                n.starts_with("frame_") && n.ends_with(ext)
             });
             has_frames.then(|| Confirmation {
                 title: "Replace exported frames?".into(),
@@ -328,7 +345,7 @@ pub fn confirmation(s: &Session, id: &str, p: &Value) -> Option<Confirmation> {
             (n > 1).then(|| Confirmation {
                 title: "Remove bone?".into(),
                 message: format!(
-                    "{name}{} {} posed over {}; removing takes {} out of every pose. The instances stay where they are now, on a layer of their own. You can undo this.",
+                    "{name}{} {} posed over {}; removing takes {} out of every pose. What the bones moved stays as it looks now (instances and whole shapes on a layer of their own). You can undo this.",
                     if below > 0 { format!(" and the {} below it", plural(below, "bone")) } else { String::new() },
                     if below > 0 { "are" } else { "is" },
                     plural(n, "keyframe"),
@@ -339,7 +356,26 @@ pub fn confirmation(s: &Session, id: &str, p: &Value) -> Option<Confirmation> {
             })
         }
         "layer.delete" => {
-            let l = target_layer(s, p)?;
+            // Several layers at once (the layers selected in the layer list, ADR 0131).
+            let ids = crate::cmds_timeline::layer_targets(s, p).ok()?;
+            if ids.len() > 1 {
+                let tl = s.timeline();
+                // Each with what it holds: a folder goes with everything in it.
+                let mut rows = std::collections::BTreeSet::new();
+                for id in &ids {
+                    let i = tl.layers.iter().position(|x| x.id == *id)?;
+                    let folder = tl.layers.get(i).is_some_and(|l| l.kind == anicraft_doc::LayerKind::Folder);
+                    rows.extend(if folder { tl.group_range(i) } else { i..i + 1 });
+                }
+                let (keys, elements) = rows.iter().filter_map(|i| tl.layers.get(*i)).map(|x| layer_content(x)).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+                return (elements > 0).then(|| Confirmation {
+                    title: "Delete layers?".into(),
+                    message: format!("The {} selected hold {} with {}. You can undo this.", plural(rows.len(), "layer"), plural(keys, "keyframe"), plural(elements, "element")),
+                    action: "Delete Layers".into(),
+                    irreversible: false,
+                });
+            }
+            let l = ids.first().and_then(|id| s.timeline().layer(*id))?;
             if l.kind == anicraft_doc::LayerKind::Camera {
                 return camera_removal(s, l);
             }

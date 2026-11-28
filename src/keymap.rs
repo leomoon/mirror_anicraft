@@ -7,17 +7,18 @@
 //! ones that open this editor, the palette and preferences, quitting, playing and cancelling.
 //! A chord is written in registry notation, modifiers in a fixed order: `Ctrl+Alt+Shift+K`.
 
-use crate::app::{Tool, VIEW_SHORTCUTS};
+use crate::app::{Tool, VIEW_SHORTCUTS, VIEW_UNBOUND};
 use anicraft_engine::{SHORTCUT_ALIASES, commands};
 use egui::{Key, Modifiers};
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Keys handled before the shortcut map, which the editor will not assign, and what for
 /// (English: translated where it is shown).
 pub const RESERVED: &[(&str, &str)] = &[
     ("Ctrl+K", tr_noop!("the command palette")),
     ("Ctrl+Shift+P", tr_noop!("the command palette")),
-    ("F1", tr_noop!("the shortcut editor")),
+    ("F1", tr_noop!("help for what you are pointing at")),
     ("Ctrl+Alt+Shift+K", tr_noop!("the shortcut editor")),
     ("Ctrl+U", tr_noop!("Preferences")),
     ("Ctrl+,", tr_noop!("Preferences")),
@@ -88,14 +89,78 @@ fn view_label(id: &str) -> &'static str {
         "view.find_next" => tr_noop!("Find Next"),
         "view.find_prev" => tr_noop!("Find Previous"),
         "view.movie_explorer" => tr_noop!("Movie Explorer"),
+        "view.panel.properties" => tr_noop!("Properties Panel"),
+        "view.panel.align" => tr_noop!("Align Panel"),
+        "view.panel.colour" => tr_noop!("Colour Panel"),
+        "view.panel.library" => tr_noop!("Library Panel"),
+        "view.panel.history" => tr_noop!("History Panel"),
+        "view.panel.layer_depth" => tr_noop!("Layer Depth Panel"),
+        "view.panel.timeline" => tr_noop!("Timeline Panel"),
+        "view.panel.motion_editor" => tr_noop!("Motion Editor Panel"),
+        "view.panel.output" => tr_noop!("Output Panel"),
+        "view.panel.swatches" => tr_noop!("Swatches Panel"),
+        "view.panel.tools" => tr_noop!("Tools Panel"),
+        "view.hide_panels" => tr_noop!("Hide Panels / Show Panels"),
+        "view.close_document" => tr_noop!("Close Document"),
+        "view.close_all_documents" => tr_noop!("Close All Documents"),
+        "view.next_document" => tr_noop!("Next Document"),
+        "view.prev_document" => tr_noop!("Previous Document"),
         "view.brush_smaller" => tr_noop!("Brush Size Down"),
         "view.brush_larger" => tr_noop!("Brush Size Up"),
         _ => tr_noop!("View action"),
     }
 }
 
+/// The start of a saved command's action id (ADR 0097): `macro:<its name>`.
+pub const MACRO_PREFIX: &str = "macro:";
+
+/// Most distinct saved command names the map ever binds in one run (see [`intern`]).
+const MAX_INTERNED: usize = 4096;
+
+thread_local! {
+    /// The saved commands that can carry a shortcut, as `(action id, name)`, in their order.
+    static MACROS: RefCell<Vec<(&'static str, &'static str)>> = const { RefCell::new(Vec::new()) };
+    static INTERNED: RefCell<BTreeSet<&'static str>> = const { RefCell::new(BTreeSet::new()) };
+}
+
+/// `s` for the life of the program, each distinct string kept once. An action's id and label
+/// are `&'static str` everywhere the map is used; saved commands are the only actions named at
+/// run time, and a run meets a handful of their names, so keeping each one is the simple
+/// choice. Past [`MAX_INTERNED`] names a new one can't carry a shortcut until the next start.
+fn intern(s: &str) -> Option<&'static str> {
+    INTERNED.with(|set| {
+        let mut set = set.borrow_mut();
+        if let Some(kept) = set.get(s) {
+            return Some(*kept);
+        }
+        if set.len() >= MAX_INTERNED {
+            return None;
+        }
+        let kept: &'static str = Box::leak(s.to_string().into_boxed_str());
+        set.insert(kept);
+        Some(kept)
+    })
+}
+
+/// A saved command's action id.
+pub fn macro_id(name: &str) -> String {
+    format!("{MACRO_PREFIX}{name}")
+}
+
+/// The saved command an action id names.
+pub fn macro_name(id: &str) -> Option<&str> {
+    id.strip_prefix(MACRO_PREFIX)
+}
+
+/// The saved commands, in their order, as actions that can carry a shortcut (Manage Saved
+/// Commands sets them whenever the list changes; rebuild the [`Keymap`] after).
+pub fn set_macros<'a>(names: impl IntoIterator<Item = &'a str>) {
+    let list: Vec<(&'static str, &'static str)> = names.into_iter().filter_map(|n| Some((intern(&macro_id(n))?, intern(n)?))).collect();
+    MACROS.with(|m| *m.borrow_mut() = list);
+}
+
 /// Every action that can carry a shortcut: the menu commands, any command with a default key,
-/// the tools and the view keys.
+/// the tools, the view keys and the saved commands.
 pub fn actions() -> Vec<Action> {
     let mut v: Vec<Action> = commands()
         .into_iter()
@@ -109,7 +174,7 @@ pub fn actions() -> Vec<Action> {
         .collect();
     v.extend(Tool::ALL.into_iter().map(|t| Action { id: tool_id(t), label: t.label(), group: tr_noop!("Tools"), defaults: t.shortcut().into_iter().collect() }));
     let mut views: Vec<&str> = Vec::new();
-    for (_, id) in VIEW_SHORTCUTS {
+    for id in VIEW_SHORTCUTS.iter().map(|(_, id)| id).chain(VIEW_UNBOUND) {
         if !views.contains(id) {
             views.push(id);
         }
@@ -120,6 +185,7 @@ pub fn actions() -> Vec<Action> {
         group: tr_noop!("View"),
         defaults: VIEW_SHORTCUTS.iter().filter(|(_, i)| *i == id).map(|(k, _)| *k).collect(),
     }));
+    MACROS.with(|m| v.extend(m.borrow().iter().map(|&(id, label)| Action { id, label, group: tr_noop!("Commands"), defaults: Vec::new() })));
     v
 }
 
@@ -192,11 +258,17 @@ pub struct Keymap {
 impl Keymap {
     pub fn new(overrides: &BTreeMap<String, Vec<String>>) -> Keymap {
         let actions = actions();
+        // A chord bound twice (a saved command's key in a hand-edited preferences file) stays
+        // with the action listed first.
+        let mut taken: BTreeSet<String> = BTreeSet::new();
         let keys = actions
             .iter()
-            .map(|a| match overrides.get(a.id) {
-                Some(user) => user.iter().filter_map(|k| normalize(k)).collect(),
-                None => a.defaults.iter().filter_map(|k| normalize(k)).collect(),
+            .map(|a| {
+                let ks: Vec<String> = match overrides.get(a.id) {
+                    Some(user) => user.iter().filter_map(|k| normalize(k)).collect(),
+                    None => a.defaults.iter().filter_map(|k| normalize(k)).collect(),
+                };
+                ks.into_iter().filter(|k| taken.insert(k.clone())).collect()
             })
             .collect();
         Keymap { actions, keys }
@@ -326,7 +398,9 @@ pub fn sanitize(overrides: BTreeMap<String, Vec<String>>) -> BTreeMap<String, Ve
     let known = actions();
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (id, keys) in overrides.into_iter().take(1_000) {
-        if !known.iter().any(|a| a.id == id) {
+        // A saved command's keys are kept while it isn't listed yet (they bind once it is).
+        let saved = macro_name(&id).is_some_and(|n| !n.is_empty() && n.chars().count() <= 64);
+        if !saved && !known.iter().any(|a| a.id == id) {
             continue;
         }
         let mut clean: Vec<String> = Vec::new();
@@ -379,6 +453,15 @@ mod tests {
         assert_eq!(m.keys("view.brush_smaller"), ["["]);
         assert_eq!(m.keys("view.brush_larger"), ["]"]);
         assert_eq!(m.primary("view.onion"), Some("Alt+Shift+O"));
+        // #456: every panel is an action, with Animate's key where it is free.
+        for p in crate::dock::Panel::ALL {
+            assert!(m.actions.iter().any(|a| a.id == p.action() && a.label != "View action"), "{p:?} has no action");
+            assert_eq!(crate::dock::Panel::from_action(p.action()), Some(p));
+        }
+        assert_eq!(m.primary("view.panel.library"), Some("Ctrl+L"));
+        assert_eq!(m.primary("view.panel.timeline"), Some("Ctrl+Alt+T"));
+        assert_eq!(m.primary("view.panel.align"), None, "Ctrl+K is the command palette");
+        assert_eq!(m.primary("view.hide_panels"), Some("F4"));
         assert_eq!(m.owner("ctrl+z").map(|a| a.id), None, "chords are case-sensitive registry names");
         assert_eq!(m.owner("Ctrl+Shift+Z").map(|a| a.id), Some("modify.remove_transform"));
         let mut all: Vec<String> = m.actions.iter().flat_map(|a| m.keys(a.id).to_vec()).collect();

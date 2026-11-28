@@ -1,6 +1,7 @@
 //! The Brush tool's command (ADR 0033): a stroke of the brush paints a filled shape, the area its
-//! tip sweeps, in the fill colour. Off Object Drawing it is a raw shape that merges with the
-//! drawing (ADR 0031), placed by the paint mode.
+//! tip sweeps, in the fill colour. Off Object Drawing an opaque stroke merges with the drawing
+//! (ADR 0031), placed by the paint mode. A fill that is not fully opaque stays its own shape and
+//! composites over what is behind it (ADR 0102).
 
 use crate::brush_library::{BUILTIN, BrushLibrary, BrushPreset, MAX_FILE_BYTES, MAX_USER_PRESETS, builtin, builtin_hint, clean_name};
 use crate::cmds_draw::{MAX_EXTENT, add_shape, object_param};
@@ -9,7 +10,7 @@ use crate::params::*;
 use crate::{CommandSpec, EngineError, Result, Session};
 use anicraft_doc::{ColorEffect, Element, ElementId, ElementKind, MAX_WIDTH_POINTS, Paint, Rgba, Shape, Stroke, WidthPoint, WidthProfile};
 use anicraft_geom::planar;
-use anicraft_geom::brush::{MAX_SAMPLES, Sample, Tilt, Tip, TipShape, centre_stroke, outline_shaped};
+use anicraft_geom::brush::{MAX_SAMPLES, Sample, Shaping, Tilt, Tip, TipShape, centre_stroke, outline_shaped};
 use anicraft_geom::{Affine, FillRule, Path, PathCmd, Vec2};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -20,7 +21,7 @@ pub fn specs() -> Vec<CommandSpec> {
         c(
             "draw.brush",
             "Brush Stroke",
-            "{points: [[x, y], [x, y, pressure 0..1 (clamped)] or [x, y, pressure, altitude, azimuth] (the pen's tilt in degrees: altitude 90 upright to 0 flat, azimuth the way it leans, clockwise from +x)], ..] (one point paints a dab), preset? (a brush from brush.preset_list, by key or name: its settings are the defaults for the rest), size? (stage units, default 10), shape?: round|square, angle? (degrees), roundness? (5..100 %, default 100), smoothing? (0..100, default 50), curve?: linear|soft|firm|[[pressure, output], ..] (how pressure maps, both 0..1), pressure_size? (default true: pressure varies the size from 10 to 100 %), pressure_opacity? (default false: the stroke's average pressure sets its opacity), taper_start?, taper_end? (0..50 % of the stroke's length), spacing? (0 continuous, or 5..1000 % of the size between dabs), jitter? (0..50 % of the size: a ragged edge), texture? (0..100 %: a paper grain of holes through the paint), scatter? (0..200 % of the size: dabs thrown either side of the line, varied in size), tilt_angle? (the pen's tilt turns the tip: its angle plus the azimuth), tilt_width? (the pen's tilt widens the tip, up to twice as wide flat; also the Paint Brush's width), as_stroke? (default false; true: the Paint Brush, a variable-width stroke in the stroke colour, editable with the Width tool), mode?: normal|fills|behind|selection|inside (Paint Normal covers fills and lines, Paint Fills leaves lines, Paint Behind paints only empty areas, Paint Selection only inside the selected fills, Paint Inside only inside the fill the stroke starts on or the empty area closed off around it; ADR 0080), color? (default: the fill colour, or the stroke colour as a stroke), unit? (stage units per screen point, default 1: smoothing and accuracy follow it), object?}",
+            "{points: [[x, y], [x, y, pressure 0..1 (clamped)] or [x, y, pressure, altitude, azimuth] (the pen's tilt in degrees: altitude 90 upright to 0 flat, azimuth the way it leans, clockwise from +x)], ..] (one point paints a dab), preset? (a brush from brush.preset_list, by key or name: its settings are the defaults for the rest), size? (stage units, default 10), shape?: round|square, angle? (degrees), roundness? (5..100 %, default 100), smoothing? (0..100, default 50), curve?: linear|soft|firm|[[pressure, output], ..] (how pressure maps, both 0..1), pressure_size? (default true: pressure varies the size from 10 to 100 %), pressure_opacity? (default false: the stroke's average pressure sets its opacity), taper_start?, taper_end? (0..50 % of the stroke's length), spacing? (0 continuous, or 5..1000 % of the size between dabs), jitter? (0..50 % of the size: a ragged edge), texture? (0..100 %: a paper grain of holes through the paint), scatter? (0..200 % of the size: dabs thrown either side of the line, varied in size), tilt_angle? (the pen's tilt turns the tip: its angle plus the azimuth), tilt_width? (the pen's tilt widens the tip, up to twice as wide flat; also the Paint Brush's width), as_stroke? (default false; true: the Paint Brush, a variable-width stroke in the stroke colour, editable with the Width tool), mode?: normal|fills|behind|selection|inside (Paint Normal covers fills and lines, Paint Fills leaves lines, Paint Behind paints only empty areas, Paint Selection only inside the selected fills, Paint Inside only inside the fill the stroke starts on or the empty area closed off around it; ADR 0080), color? (default: the fill colour, or the stroke colour as a stroke), unit? (stage units per screen point, default 1: smoothing and accuracy follow it), object? (default the Object Drawing setting; a fill that is not fully opaque is its own shape, so it composites over what is behind it)}",
             true,
             draw_brush as crate::RunFn,
         ),
@@ -225,31 +226,108 @@ pub fn pressure_opacity(b: &BrushPreset, pts: &[Sample]) -> f32 {
     (pts.iter().map(|x| b.curve.map(x.pressure)).sum::<f32>() / pts.len() as f32).clamp(0.05, 1.0)
 }
 
-fn draw_brush(s: &mut Session, p: &Value) -> Result<Value> {
+/// A fill that is not fully opaque has to stay its own shape. Merge drawing replaces what the
+/// new shape covers, so a wash would hide the colour behind it, and two washes of one colour
+/// would join instead of darkening where they cross (ADR 0102).
+fn paint_stacks(p: &Paint) -> bool {
+    match p {
+        Paint::Solid(c) => c.a < 1.0,
+        Paint::Linear { stops, .. } | Paint::Radial { stops, .. } => stops.iter().any(|s| s.color.a < 1.0),
+        Paint::Bitmap { .. } => false,
+    }
+}
+
+/// What a Brush stroke's outline is traced from: the samples (their pressure already through
+/// the brush's curve), the tip, the shaping, and how closely the hand and the outline are
+/// followed. Tracing is the slow part of a long stroke and depends on nothing else, so the
+/// editor does it on another thread and hands the result to `draw.brush` (ADR 0129).
+#[derive(Clone, Debug, PartialEq)]
+pub struct StrokeRequest {
+    pts: Vec<Sample>,
+    tip: Tip,
+    shaping: Shaping,
+    smoothing: f32,
+    tol: f32,
+}
+
+impl StrokeRequest {
+    /// The filled outline (`geom::brush::outline_shaped`). Bounded for any stroke: the grid by
+    /// `MAX_CELLS`, the sampling by `MAX_STAMP_WORK`, the loops by `MAX_LOOPS`.
+    pub fn trace(&self) -> Path {
+        outline_shaped(&self.pts, &self.tip, &self.shaping, self.smoothing, self.tol)
+    }
+
+    /// Traces the outline: what [`Session::staged_stroke`] takes.
+    pub fn prepare(self) -> PreparedStroke {
+        let path = self.trace();
+        PreparedStroke { request: self, path }
+    }
+
+    /// How many samples the stroke has.
+    pub fn samples(&self) -> usize {
+        self.pts.len()
+    }
+}
+
+/// A stroke's outline, traced ahead of the command that paints it.
+#[derive(Clone, Debug)]
+pub struct PreparedStroke {
+    request: StrokeRequest,
+    path: Path,
+}
+
+impl PreparedStroke {
+    /// The same request with another outline, so a test can tell a taken outline from a traced
+    /// one.
+    #[cfg(test)]
+    pub(crate) fn with_path(self, path: Path) -> PreparedStroke {
+        PreparedStroke { path, ..self }
+    }
+}
+
+/// The request `draw.brush` with params `p` would trace. An error is the command's own (the
+/// same params fail the same way there).
+pub fn stroke_request(s: &Session, p: &Value) -> Result<StrokeRequest> {
+    stroke_inputs(s, p).map(|x| x.0)
+}
+
+/// [`stroke_request`], with the brush it paints with and the opacity its pressure gives it.
+fn stroke_inputs(s: &Session, p: &Value) -> Result<(StrokeRequest, BrushPreset, f32)> {
     let pts = bounded_samples(p)?;
     let b = brush_param(s, p)?;
     let tip = b.tip();
-    let size = tip.size;
-    let as_stroke = opt_bool(p, "as_stroke")?.unwrap_or(false);
     let unit = ranged(p, "unit", 0.001..=1000.0, 1.0)?;
-    let mode_key = opt_str(p, "mode")?.unwrap_or("normal");
-    let mode = PaintMode::from_key(mode_key).ok_or_else(|| EngineError::Param(format!("unknown paint mode '{mode_key}' (normal, fills, behind, selection or inside)")))?;
-    let color = opt_color(p, "color")?.unwrap_or(if as_stroke { s.style.stroke } else { s.style.fill });
-    let color = Rgba { a: color.a * pressure_opacity(&b, &pts), ..color };
-    let object = object_param(s, p)?;
+    let opacity = pressure_opacity(&b, &pts);
     // Pressure through the curve (ADR 0068) before it sizes the tip.
     let pts: Vec<Sample> = pts.iter().map(|x| Sample { pressure: b.size_pressure(x.pressure), ..*x }).collect();
-
     // Smoothing and accuracy are screen distances, so a stroke looks the same at any zoom: at 50
     // the centre line may wander 3.3 screen points from the hand, at 0 a third of a point.
     // The outline is fitted within a third of a screen point, or a hundredth of the size for
     // small brushes (so a small dab is still round).
-    let (smoothing, tol) = (unit * (0.3 + b.smoothing * 0.06), (unit * 0.35).min(size * 0.01));
+    let (smoothing, tol) = (unit * (0.3 + b.smoothing * 0.06), (unit * 0.35).min(tip.size * 0.01));
+    Ok((StrokeRequest { pts, tip, shaping: b.shaping(), smoothing, tol }, b, opacity))
+}
+
+fn draw_brush(s: &mut Session, p: &Value) -> Result<Value> {
+    // An outline traced ahead is this stroke's or nobody's: it never waits for a later one.
+    let staged = s.staged_stroke.take();
+    let (request, b, opacity) = stroke_inputs(s, p)?;
+    let pts = &request.pts;
+    let (smoothing, tol) = (request.smoothing, request.tol);
+    let as_stroke = opt_bool(p, "as_stroke")?.unwrap_or(false);
+    let mode_key = opt_str(p, "mode")?.unwrap_or("normal");
+    let mode = PaintMode::from_key(mode_key).ok_or_else(|| EngineError::Param(format!("unknown paint mode '{mode_key}' (normal, fills, behind, selection or inside)")))?;
+    let color = opt_color(p, "color")?.unwrap_or(if as_stroke { s.style.stroke } else { s.style.fill });
+    let color = Rgba { a: color.a * opacity, ..color };
+    let object = object_param(s, p)?;
     if as_stroke {
-        return paint_stroke(s, &pts, &b, smoothing, tol, color, object);
+        return paint_stroke(s, pts, &b, smoothing, tol, color, object);
     }
     let start = pts.first().map_or(Vec2::ZERO, |x| x.at);
-    let mut path = outline_shaped(&pts, &tip, &b.shaping(), smoothing, tol);
+    let mut path = match staged {
+        Some(ahead) if ahead.request == request => ahead.path,
+        _ => request.trace(),
+    };
     if !path.cmds.iter().any(|c| matches!(c, PathCmd::CubicTo(..) | PathCmd::LineTo(..))) {
         return Err(EngineError::Param("the stroke is too small to paint".into()));
     }
@@ -296,18 +374,20 @@ fn draw_brush(s: &mut Session, p: &Value) -> Result<Value> {
         Some(_) if p.get("color").is_none_or(Value::is_null) && color.a >= 1.0 => s.style.fill_paint_for(&Affine::translate(-c.x, -c.y), &local.bounds()),
         _ => Paint::Solid(color),
     };
+    // Opaque ink joins the drawing. A wash stays its own shape and composites (ADR 0102).
+    let own = object || paint_stacks(&fill);
     let id = ElementId(s.doc.alloc_id());
     let el = Element {
         id,
         name: String::new(),
         transform: Affine::translate(c.x, c.y),
         color: ColorEffect::default(),
-        kind: ElementKind::Shape(Shape { path: Arc::new(local), fill: Some(fill), stroke: None, fill_rule: FillRule::EvenOdd, merge: !object, warp: None }),
+        kind: ElementKind::Shape(Shape { path: Arc::new(local), fill: Some(fill), stroke: None, fill_rule: FillRule::EvenOdd, merge: !own, warp: None }),
     };
     if s.editable_keyframe()?.elements.len() >= 100_000 {
         return Err(EngineError::State("too many elements on this keyframe".into()));
     }
-    if object {
+    if own {
         let kf = s.editable_keyframe()?;
         match order {
             // Behind everything on the layer.
@@ -356,7 +436,8 @@ const PROFILE_TOLERANCE: f32 = 0.015;
 
 /// The Paint Brush (ADR 0068): the smoothed centre line as a stroke of the brush's size in the
 /// stroke colour, its width profile following the pressure and tapers, so the Width tool edits
-/// it afterwards. A stroke of one width is a plain line and merges like the Pencil's.
+/// it afterwards. A stroke of one width is a plain line and merges like the Pencil's. A line
+/// that is not fully opaque stays its own shape (ADR 0102).
 fn paint_stroke(s: &mut Session, pts: &[Sample], b: &BrushPreset, smoothing: f32, tol: f32, color: Rgba, object: bool) -> Result<Value> {
     let (path, factors) = centre_stroke(pts, &b.shaping(), smoothing, tol * 0.25, PROFILE_SAMPLES);
     if !path.cmds.iter().any(|c| matches!(c, PathCmd::CubicTo(..) | PathCmd::LineTo(..))) {
@@ -366,7 +447,9 @@ fn paint_stroke(s: &mut Session, pts: &[Sample], b: &BrushPreset, smoothing: f32
     let profile = WidthProfile::new(kept.iter().map(|(t, f)| WidthPoint::new(*t, *f, *f)).collect());
     let stroke = Stroke::new(color, b.size).with_profile(profile);
     let c = path.bounds().center();
-    let mut v = add_shape(s, "paint_brush", path.transformed(&Affine::translate(-c.x, -c.y)), c, None, Some(stroke), object)?;
+    // A translucent line stays its own shape too, so it composites instead of replacing.
+    let own = object || color.a < 1.0;
+    let mut v = add_shape(s, "paint_brush", path.transformed(&Affine::translate(-c.x, -c.y)), c, None, Some(stroke), own)?;
     v["width_points"] = json!(kept.len());
     Ok(v)
 }

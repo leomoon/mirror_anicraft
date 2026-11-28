@@ -53,7 +53,7 @@ fn without_tests(src: &str) -> String {
 /// Code before a literal, on its line, that makes it something other than interface text:
 /// logs and console output, ids and keys, commands and their parameters, attributes.
 const NOT_UI: &[&str] = &[
-    "eprintln!(", "println!(", "print!(", "panic!(", "assert", "unreachable!(", "Id::new(", "id_salt(", "persistent_id(", "json!(", "execute(", "perform(", "invoke(", ".run(", "find_command(", "#[", "env!(", "include_str!(", "include_bytes!(", "concat!(", "var(",
+    "eprintln!(", "println!(", "print!(", "panic!(", "assert", "unreachable!(", "Id::unique(", "id_salt(", "persistent_id(", "json!(", "execute(", "perform(", "invoke(", ".run(", "find_command(", "#[", "env!(", "include_str!(", "include_bytes!(", "concat!(", "var(",
     "contains(", "starts_with(", "ends_with(", "strip_prefix(", "strip_suffix(", "matches!(", "== ", "!= ",
     // The start-up log (`startup::line`): English, like console messages, for bug reports.
     "line(&", "write(&format!(",
@@ -122,7 +122,9 @@ fn all_keys() -> BTreeSet<Key> {
     }
     add(&doc::Easing::Linear.label());
     doc::Property::ALL.iter().for_each(|p| add(p.label()));
-    doc::FilterParam::ALL.iter().for_each(|p| add(p.label()));
+    doc::FilterParam::all().iter().for_each(|p| add(p.label()));
+    [doc::FilterColor::Color, doc::FilterColor::Shadow, doc::FilterColor::Highlight, doc::FilterColor::Stop(0)].iter().for_each(|c| add(c.label()));
+    anicraft_engine::filter_library::BUILTIN_NAMES.iter().for_each(|n| add(n));
     add("Filters");
     add("Filter");
     doc::ColorStyle::ALL.iter().for_each(|s| add(s.label()));
@@ -309,6 +311,85 @@ fn offered_languages_have_their_own_catalog_and_a_ready_script() {
 }
 
 #[test]
+fn georgian_is_offered_only_when_its_face_is_embedded() {
+    let ka = [("ka", "", "@id\tlanguage.name\tქართული\n")];
+    let offered = |face: bool| Languages::new(&ka, &ready_with(face)).0.list.iter().any(|l| l.code == "ka");
+    assert!(!offered(false), "no face, no Georgian");
+    assert!(offered(true));
+    // The real build agrees with its own face.
+    assert_eq!(ready_codes().contains(&"ka"), crate::theme::georgian_font().is_some());
+    // CRAFT_FONTS_REQUIRED=1 (release builds, CI with craft-fonts) makes a missing face a failure.
+    let face = crate::theme::georgian_font();
+    if std::env::var("CRAFT_FONTS_REQUIRED").is_ok_and(|v| v == "1") {
+        assert!(face.is_some(), "CRAFT_FONTS_REQUIRED=1 but this build embeds no valid NotoSansGeorgian.ttf (craft-fonts `Geor`)");
+    }
+    let Some(face) = face else {
+        println!("georgian face test: skipped, this build embeds no Georgian face");
+        return;
+    };
+    let letters: String = ('\u{10D0}'..='\u{10FA}').collect();
+    let fonts = anicraft_engine::text::Fonts::from_faces([face.to_vec()]);
+    let laid = fonts.layout(&letters, &anicraft_engine::text::Style::default()).expect("layout");
+    assert_eq!(laid.missing, 0, "the face lacks some of U+10D0..U+10FA");
+    // ... and through the Proportional family install_fonts builds. Not Monospace: epaint's
+    // has_glyph is a false negative there (the Georgian face is that chain's replacement-glyph face).
+    let ctx = egui::Context::default();
+    crate::theme::install_fonts(&ctx, None, None, &[]);
+    ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear(); // fonts apply at the start of a frame
+    let prop = egui::FontId::proportional(14.0);
+    assert!(ctx.fonts_mut(|f| f.has_glyphs(&prop, &letters)), "Proportional lacks Georgian letters");
+    println!("georgian face test: ran, {} letters covered", letters.chars().count());
+}
+
+#[test]
+fn hebrew_is_not_offered_yet_but_its_face_draws_hebrew_names() {
+    let he = [("he", "", "@id\tlanguage.name\tעברית\n")];
+    // Right to left needs bidi layout in egui (ADR 0040): with or without a face, not offered.
+    assert!(!ready_codes().contains(&"he"));
+    for georgian_face in [false, true] {
+        assert!(!Languages::new(&he, &ready_with(georgian_face)).0.list.iter().any(|l| l.code == "he"));
+    }
+    // The catalog itself loads cleanly once the code is ready.
+    assert!(Languages::new(&he, &["he"]).0.list.iter().any(|l| l.code == "he"));
+    let face = crate::theme::hebrew_font();
+    if std::env::var("CRAFT_FONTS_REQUIRED").is_ok_and(|v| v == "1") {
+        assert!(face.is_some(), "CRAFT_FONTS_REQUIRED=1 but this build embeds no valid NotoSansHebrew-Regular.ttf (craft-fonts `Hebr`)");
+    }
+    let Some(face) = face else {
+        println!("hebrew face test: skipped, this build embeds no Hebrew face");
+        return;
+    };
+    let letters: String = ('\u{05D0}'..='\u{05EA}').collect();
+    let fonts = anicraft_engine::text::Fonts::from_faces([face.to_vec()]);
+    let laid = fonts.layout(&letters, &anicraft_engine::text::Style::default()).expect("layout");
+    assert_eq!(laid.missing, 0, "the face lacks some of U+05D0..U+05EA");
+    // ... and through the Proportional family install_fonts builds (see the Georgian test).
+    let ctx = egui::Context::default();
+    crate::theme::install_fonts(&ctx, None, None, &[]);
+    ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+    let prop = egui::FontId::proportional(14.0);
+    assert!(ctx.fonts_mut(|f| f.has_glyphs(&prop, &letters)), "Proportional lacks Hebrew letters");
+    // Georgian still draws with the Hebrew face behind it in the chain.
+    if crate::theme::georgian_font().is_some() {
+        let georgian: String = ('\u{10D0}'..='\u{10FA}').collect();
+        assert!(ctx.fonts_mut(|f| f.has_glyphs(&prop, &georgian)), "Proportional lost Georgian letters");
+    }
+    println!("hebrew face test: ran, {} letters covered", letters.chars().count());
+}
+
+#[test]
+fn right_to_left_codes_are_recognised_by_language_and_script() {
+    for rtl in ["he", "he-IL", "he-Hebr-IL", "he-x-test", "iw", "iw_IL", "iw_IL.UTF-8", "ar", "fa-IR", "ku-Arab-IQ", "zh-yue-Arab"] {
+        assert!(is_rtl_code(rtl), "{rtl}");
+    }
+    for ltr in ["en", "ka", "ku-Latn-TR", "sd-Deva-IN", "en-x-arab", "x-Arab", "x-Hebr", "", "-", "pseudo"] {
+        assert!(!is_rtl_code(ltr), "{ltr}");
+    }
+    // No right-to-left language is offered, so the interface never is.
+    assert!(!is_rtl());
+}
+
+#[test]
 fn lookups_fall_back_from_app_to_shared_to_base_language_to_english() {
     let l = fixture();
     let (de, pt_br, ru) = (1, 2, 3);
@@ -327,6 +408,24 @@ fn lookups_fall_back_from_app_to_shared_to_base_language_to_english() {
     assert_eq!([1, 3, 5, 21].map(|n| l.plural(ru, "{n} frame", "{n} frames", n)), ["{n} кадр", "{n} кадра", "{n} кадров", "{n} кадр"]);
     assert_eq!(l.plural(ru, "{n} layer", "{n} layers", 5), "{n} layers", "two forms for Russian: skipped");
     assert_eq!(l.plural(0, "{n} frame", "{n} frames", 1), "{n} frame");
+}
+
+#[test]
+fn hebrew_two_uses_the_second_catalog_plural_form() {
+    // Hebrew is not offered in production until RTL is supported; this exercises its
+    // existing parser and runtime by explicitly enabling the locale for this unit test.
+    let he_app = "@plural\t{n} frame|{n} frames\t{n} פריים|{n} פריימים (זוג)|{n} פריימים\n";
+    let (languages, problems) = Languages::new(&[("he", "", he_app)], &["he"]);
+    assert!(problems.is_empty(), "{problems:?}");
+    let he = languages.find("he").expect("fixture Hebrew should be offered");
+    let get = |n| languages.plural(he, "{n} frame", "{n} frames", n);
+    assert_eq!(get(0), "{n} פריימים");
+    assert_eq!(get(1), "{n} פריים");
+    assert_eq!(get(2), "{n} פריימים (זוג)", "n=2 must not fall through to other");
+    assert_eq!(get(3), "{n} פריימים");
+    assert_eq!(get(21), "{n} פריימים");
+    let n = 2u64;
+    assert_eq!(fill(get(n), &[("n", &n as &dyn std::fmt::Display)]), "2 פריימים (זוג)");
 }
 
 #[test]
@@ -371,6 +470,22 @@ fn system_locales_and_preferences_resolve() {
     assert_eq!(code("xx-new", Some("ru-RU")), "ru", "a code this build lacks follows the system");
     assert_eq!(code(PSEUDO, Some("de")), "pseudo");
     assert_eq!(code(AUTO, Some("pseudo")), "en", "the system never picks the pseudo-locale");
+}
+
+#[test]
+fn legacy_iw_locale_tags_normalize_to_hebrew() {
+    let embedded = [("he", "\tSave\tשמור\n", "@id\tlanguage.name\tעברית\n\tOpen\tפתח\n")];
+    let (l, problems) = Languages::new(&embedded, &["he"]);
+    assert!(problems.is_empty(), "{problems:?}");
+    let code = |pref: &str, sys: Option<&str>| l.get(l.resolve(pref, sys)).code.clone();
+    for tag in ["he", "he-IL", "iw", "iw-IL", "iw_IL.UTF-8"] {
+        assert_eq!(code(AUTO, Some(tag)), "he", "{tag}");
+    }
+    for pref in ["he", "HE", "iw", "IW"] {
+        assert_eq!(code(pref, None), "he", "{pref}");
+    }
+    // Only the whole first subtag is the legacy code: `iwx` is some other language.
+    assert_eq!(code(AUTO, Some("iwx-IL")), "en");
 }
 
 #[test]
@@ -460,8 +575,33 @@ fn strings_in(v: &serde_json::Value, out: &mut BTreeSet<String>) {
     }
 }
 
-/// Names egui gives its own parts.
-const EGUI_OWN: [&str; 1] = ["Close window"];
+/// Names egui gives its own parts: a window's close button, and (since egui 0.37) the handles
+/// that resize a panel or a window. egui offers no way to name them ourselves.
+const EGUI_OWN: [&str; 14] = [
+    // egui's colour mixer (the picker's Mixer view) names its sliders and its value button, and
+    // since egui 0.37 passes their tooltips on too.
+    "Hue",
+    "Alpha",
+    "Click to copy color values",
+    "Showing color values in 0-255 gamma space",
+    "Close window",
+    "Resize panel",
+    "Resize window right edge",
+    "Resize window left edge",
+    "Resize window bottom edge",
+    "Resize window top edge",
+    "Resize window bottom-right corner",
+    "Resize window top-right corner",
+    "Resize window bottom-left corner",
+    "Resize window top-left corner",
+];
+
+/// A file's path, as a recent file's or a template's tooltip shows it (egui 0.37 hands a tooltip
+/// to screen readers as the control's description): data, not words to translate.
+fn is_file_path(name: &str) -> bool {
+    let ext = std::path::Path::new(name).extension().and_then(|e| e.to_str());
+    name.contains(['/', '\\']) && !name.ends_with('…') && ext.is_some_and(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()))
+}
 
 /// Names a screen reader would announce that are still plain English in the pseudo-locale,
 /// for the window after `setup` (a few frames to settle).
@@ -482,6 +622,31 @@ fn screen() -> egui::RawInput {
     egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 940.0))), ..Default::default() }
 }
 
+// AniCraft is a product identifier, not an untranslated English UI label. Keep the
+// exemption exact: a label like "AniCraft settings" must still be checked.
+fn pseudo_name_is_translated_or_exempt(name: &str) -> bool {
+    name.chars().any(pseudo::is_accented) || EGUI_OWN.contains(&name) || name == "AniCraft"
+}
+
+#[test]
+fn pseudo_a11y_name_exception_is_only_the_product_name() {
+    assert!(pseudo_name_is_translated_or_exempt("AniCraft"));
+    assert!(pseudo_name_is_translated_or_exempt("[Šàvé ~~]"));
+    assert!(!pseudo_name_is_translated_or_exempt("Save"));
+    assert!(!pseudo_name_is_translated_or_exempt("AniCraft settings"));
+    assert!(!pseudo_name_is_translated_or_exempt("Save AniCraft"));
+}
+
+#[test]
+fn a_file_path_is_data_but_a_sentence_with_a_slash_is_not() {
+    assert!(is_file_path("Characters/Walk cycle.anicraft"));
+    assert!(is_file_path("/tmp/AniCraft samples/Title card.anicraft"));
+    assert!(is_file_path(r"C:\Users\me\Walk cycle.fla"));
+    assert!(!is_file_path("Import/Export…"));
+    assert!(!is_file_path("Open an .fla or .xfl"));
+    assert!(!is_file_path("Show or hide the layer"));
+}
+
 /// Names in `nodes` that are ours and still plain English.
 fn plain_names(what: &str, app: &crate::app::App, nodes: Vec<(egui::accesskit::NodeId, egui::accesskit::Node)>) -> Vec<String> {
     // Document text is the document's (layer, symbol and scene names): not ours to translate.
@@ -489,14 +654,17 @@ fn plain_names(what: &str, app: &crate::app::App, nodes: Vec<(egui::accesskit::N
     if let Ok(v) = serde_json::to_value(&app.s.doc) {
         strings_in(&v, &mut doc_text);
     }
+    // So are the names of documents opened from a file (their file names, in the Window menu).
+    // An unsaved document's "Untitled" is ours, so it still has to be translated.
+    doc_text.extend(crate::tabs::infos(app).into_iter().filter(|t| t.path.is_some()).map(|t| t.name));
     let mut found = BTreeSet::new();
     for (_, n) in nodes {
         for name in [n.label(), n.description()].into_iter().flatten() {
             // egui names its own window close button; it offers no way to name it ourselves
             // (docs/localisation.md › Not yet). The product name stays as it is in every
             // language (the macOS app menu is titled with it, ADR 0006), as the source scan allows.
-            let translated = name.chars().any(pseudo::is_accented) || EGUI_OWN.contains(&name) || name == "AniCraft";
-            let ours = scan::is_prose(name) && !doc_text.contains(name) && !doc_text.iter().any(|d| name.contains(d.as_str()));
+            let translated = pseudo_name_is_translated_or_exempt(name);
+            let ours = scan::is_prose(name) && !is_file_path(name) && !doc_text.contains(name) && !doc_text.iter().any(|d| name.contains(d.as_str()));
             if ours && !translated {
                 found.insert(format!("[{what}] {:?} {name:?}", n.role()));
             }
@@ -602,7 +770,7 @@ fn every_control_can_be_used_in_the_pseudo_locale() {
             a.run("element.set_color_effect", serde_json::json!({"style": style}));
         }));
     }
-    for panel in ["sound", "camera", "springbones", "shapebones", "shapeweights", "warp", "motion", "motionpins", "actions", "script", "prefs", "envelope", "onionmenu", "editmultiple", "edittransform", "onionsymbol", "find", "explorer", "publish", "publishreport", "publishanim", "start", "testmovie", "testmovieinside", "templates", "savetemplate", "brushlibrary", "brushcurve"] {
+    for panel in ["sound", "camera", "springbones", "shapebones", "shapeweights", "warp", "motion", "motionpins", "actions", "script", "prefs", "envelope", "audiokeys", "lipsync", "onionmenu", "editmultiple", "edittransform", "onionsymbol", "find", "explorer", "publish", "publishreport", "publishanim", "start", "testmovie", "testmovieinside", "templates", "savetemplate", "brushlibrary", "brushcurve"] {
         found.extend(click_everything(panel, |a, _| a.open_panel(Some(panel))));
     }
     // Test Movie in a window of its own (ADR 0062; egui stands in for the window system here).
@@ -792,12 +960,12 @@ fn screen_reader_names_are_translated_too() {
     }
     found.extend(untranslated_names("close guard", |a, _| {
         a.run("layer.new", serde_json::json!({}));
-        a.close_dialog = true;
+        crate::tabs::quit(a);
     }));
     found.extend(untranslated_names("library item", |a, _| {
         a.library_sel = a.s.doc.library.first().map(|s| crate::app::LibraryItem::Symbol(s.id));
     }));
-    for panel in ["start", "drop", "droplibrary", "select", "motion", "motionspan", "motionpath", "motionedit", "camera", "sound", "prefs", "shortcuts", "palette", "about", "files", "licenses", "confirm", "recovery", "frames", "filters", "plugins", "actions", "script", "scriptproblems", "testmovie", "testmovieinside", "testscript", "exporthtml", "envelope", "templates", "savetemplate", "droptimeline"] {
+    for panel in ["start", "drop", "droplibrary", "select", "motion", "motionspan", "motionpath", "motionedit", "camera", "sound", "prefs", "shortcuts", "palette", "about", "files", "licenses", "confirm", "recovery", "frames", "filters", "plugins", "actions", "script", "scriptproblems", "testmovie", "testmovieinside", "testscript", "exporthtml", "envelope", "audiokeys", "lipsync", "templates", "savetemplate", "droptimeline"] {
         found.extend(untranslated_names(panel, |a, _| a.open_panel(Some(panel))));
     }
     assert!(found.is_empty(), "{} screen-reader names not translated in the pseudo-locale:\n{}", found.len(), found.join("\n"));

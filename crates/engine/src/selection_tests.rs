@@ -608,3 +608,72 @@ fn select_with_toggle_takes_one_out_and_puts_it_back_across_layers() {
     assert!(s.selection.contains(top, a) && s.selection.contains(bottom, b));
     assert!(s.execute("element.select", &json!({"ids": [b.0], "toggle": "yes"})).is_err(), "toggle is a bool");
 }
+
+/// #341: Break Apart on an imported image turns it into a raw shape filled with the image (as
+/// in Animate), so it can be cut, erased and merged like any drawing. In 0.2.1 the command
+/// refused it ("no symbol instances or text to break apart").
+#[test]
+fn break_apart_turns_an_image_into_a_raw_shape_with_a_bitmap_fill() {
+    let mut s = Session::default();
+    let id = anicraft_doc::BitmapId(s.doc.alloc_id());
+    let png = anicraft_render::encode_png(8, 6, &[0, 0, 255, 255].repeat(48)).unwrap();
+    s.doc.bitmaps.push(Arc::new(anicraft_doc::Bitmap::from_png(id, "photo.png", png).unwrap()));
+    run(&mut s, "library.place", json!({"bitmap": id.0, "x": 100, "y": 80}));
+    let image = |s: &Session| -> Vec<bool> {
+        s.visible_elements().iter().filter_map(|e| match &e.kind {
+            ElementKind::Shape(sh) if matches!(sh.fill, Some(anicraft_doc::Paint::Bitmap { bitmap, .. }) if bitmap == id) => Some(sh.merge),
+            _ => None,
+        }).collect()
+    };
+    assert_eq!(image(&s), vec![false], "placed as an object");
+    let before = s.selection_bounds();
+    run(&mut s, "modify.break_apart", json!({}));
+    assert_eq!(image(&s), vec![true], "a raw shape, still filled with the image");
+    let after = s.selection_bounds();
+    assert!((after.min.x - before.min.x).abs() < 0.5 && (after.width() - before.width()).abs() < 0.5 && (after.height() - before.height()).abs() < 0.5, "where it was: {before:?} vs {after:?}");
+    s.undo().unwrap();
+    assert_eq!(image(&s), vec![false], "one undo brings the image object back");
+}
+
+/// #299: Break Apart on text twice. The first makes drawing objects of its letters' outlines,
+/// the second raw shapes (in 0.2.1 the second was refused). A third has nothing left to do and
+/// says so.
+#[test]
+fn break_apart_twice_on_text_ends_in_raw_shapes() {
+    let mut s = Session::default();
+    if s.execute("text.create", &json!({"text": "Hi", "x": 20, "y": 20, "size": 60, "color": "#000000"})).is_err() {
+        return; // no font on this machine
+    }
+    let kinds = |s: &Session| -> Vec<Option<bool>> {
+        let sel = s.selection.id_list();
+        s.visible_elements().iter().filter(|e| sel.contains(&e.id.0)).map(|e| match &e.kind {
+            ElementKind::Shape(sh) => Some(sh.merge),
+            _ => None,
+        }).collect()
+    };
+    run(&mut s, "modify.break_apart", json!({}));
+    assert!(!kinds(&s).is_empty() && kinds(&s).iter().all(|k| *k == Some(false)), "outlines, as drawing objects: {:?}", kinds(&s));
+    run(&mut s, "modify.break_apart", json!({}));
+    assert!(!kinds(&s).is_empty() && kinds(&s).iter().all(|k| *k == Some(true)), "raw shapes: {:?}", kinds(&s));
+    let err = s.execute("modify.break_apart", &json!({})).unwrap_err().to_string();
+    assert!(err.contains("raw shapes already"), "{err}");
+}
+
+/// #522: a marquee that touches part of a symbol instance or a group selects it whole, as it
+/// does a drawing object; one it misses stays unselected.
+#[test]
+fn a_marquee_takes_the_instances_and_groups_it_touches() {
+    let mut s = Session::default();
+    run(&mut s, "draw.ellipse", json!({"x": 0, "y": 0, "w": 100, "h": 100, "stroke": null, "object": true}));
+    run(&mut s, "modify.convert_to_symbol", json!({"name": "Dot"}));
+    run(&mut s, "edit.deselect", json!({}));
+    run(&mut s, "draw.rect", json!({"x": 200, "y": 0, "w": 100, "h": 100, "stroke": null, "object": true}));
+    run(&mut s, "modify.group", json!({}));
+    run(&mut s, "edit.deselect", json!({}));
+    run(&mut s, "draw.rect", json!({"x": 400, "y": 0, "w": 100, "h": 100, "stroke": null, "object": true}));
+    run(&mut s, "edit.deselect", json!({}));
+    // Across the lower halves of the first two only.
+    run(&mut s, "raw.select_rect", json!({"x0": -10, "y0": 50, "x1": 350, "y1": 150}));
+    let kinds: Vec<&'static str> = s.selected_elements().iter().map(|(_, e)| match e.kind { ElementKind::Symbol { .. } => "symbol", ElementKind::Group { .. } => "group", _ => "other" }).collect();
+    assert!(kinds.contains(&"symbol") && kinds.contains(&"group") && kinds.len() == 2, "{kinds:?}");
+}

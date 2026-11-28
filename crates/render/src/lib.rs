@@ -143,6 +143,12 @@ pub fn render_frame(doc: &Document, frame: u32, scale: f32) -> Result<Pixmap, Re
 
 /// Renders a display list.
 pub fn render(dl: &DisplayList, view: &View) -> Result<(Pixmap, RenderStats), RenderError> {
+    render_cut(dl, view, true)
+}
+
+/// [`render`]; `cut` off prepares every item whole (see [`unseen`]), which draws the same
+/// pixels more slowly: the tests compare the two.
+fn render_cut(dl: &DisplayList, view: &View, cut: bool) -> Result<(Pixmap, RenderStats), RenderError> {
     let mut pm = Pixmap::new(view.width, view.height)?;
     // The background is filled band by band, in parallel, just before each band draws (a
     // serial fill of a 1080p float buffer cost as much as all the drawing).
@@ -155,7 +161,7 @@ pub fn render(dl: &DisplayList, view: &View) -> Result<(Pixmap, RenderStats), Re
 
     // Phase 1 (parallel over items): cull, flatten, stroke and build shaders. Output keeps
     // display-list order.
-    let mut prepared: Vec<Vec<Prepared>> = dl.items.par_iter().zip(&in_run).map(|(item, &skip)| if skip { Vec::new() } else { prepare(item, &view.transform, surface, soft_art(dl, item)) }).collect();
+    let mut prepared: Vec<Vec<Prepared>> = dl.items.par_iter().zip(&in_run).map(|(item, &skip)| if skip { Vec::new() } else { prepare(item, &view.transform, surface, soft_art(dl, item), cut) }).collect();
     for r in &runs {
         if let (Some(op), Some(slot)) = (filtered_group(dl, r, view, surface)?, prepared.get_mut(r.start)) {
             slot.push(op);
@@ -367,7 +373,7 @@ pub fn prepare_scene(dl: &DisplayList, view: &View) -> Result<(Scene, RenderStat
     let surface = IRect { x0: 0, y0: 0, x1: view.width as i32, y1: view.height as i32 };
     let runs = filtered_runs(dl);
     let in_run = in_runs(dl, &runs);
-    let mut prepared: Vec<Vec<Prepared>> = dl.items.par_iter().zip(&in_run).map(|(item, &skip)| if skip { Vec::new() } else { prepare(item, &view.transform, surface, soft_art(dl, item)) }).collect();
+    let mut prepared: Vec<Vec<Prepared>> = dl.items.par_iter().zip(&in_run).map(|(item, &skip)| if skip { Vec::new() } else { prepare(item, &view.transform, surface, soft_art(dl, item), true) }).collect();
     let mut layers = Vec::new();
     for r in &runs {
         if let (Some(setup), Some(slot)) = (filter_setup(dl, r, view, surface), prepared.get_mut(r.start)) {
@@ -531,6 +537,8 @@ fn filter_setup(dl: &DisplayList, run: &FilteredRun, view: &View, surface: IRect
         clip_parents: dl.clip_parents.iter().map(|p| p.filter(|c| inner.contains(c))).collect(),
         clip_modes: dl.clip_modes.clone(),
         groups,
+        links: Vec::new(),
+        left_out: dl.left_out,
     };
     let sub_view = View { transform: Affine::translate(-b.x0 as f32, -b.y0 as f32).mul(&view.transform), width: b.width() as u32, height: b.height() as u32, background: None };
     let filters = group.filters.iter().map(|f| filters::resolve(f, scale)).collect();
@@ -794,10 +802,86 @@ fn soft_art(dl: &DisplayList, item: &DisplayItem) -> bool {
     item.masks.is_some_and(|c| dl.clip_mode(c).is_soft())
 }
 
+/// Whether every point of `pts` is in one of the three places where an edge between two of them
+/// adds nothing to any pixel of `surface`: above it, below it, or to its right (ADR 0132).
+///
+/// The rasterizer skips an edge above or below the rows it fills, and what an edge at or past
+/// the right end of a row deposits falls in cells no pixel reads. An edge to the *left* does
+/// count (it carries the winding into the row), so the left is not one of the places. Above is
+/// exact at the surface's first row; below and right start `far` pixels out, for a caller that
+/// asks about points it has not computed (a curve's hull: its points are sums of the hull's,
+/// rounded).
+fn unseen(pts: &[Vec2], surface: IRect, far: f32) -> bool {
+    let (top, bottom, right) = (surface.y0 as f32, surface.y1 as f32 + far, surface.x1 as f32 + far);
+    pts.iter().all(|p| p.y <= top) || pts.iter().all(|p| p.y >= bottom) || pts.iter().all(|p| p.x >= right)
+}
+
+/// How far past the surface's bottom and right a curve's hull must be for the curve to be left
+/// as its chord: more than the rounding of its points' sums could be (a few parts in ten
+/// million of the coordinates, which is under a pixel at any surface size the renderer takes).
+fn far(surface: IRect) -> f32 {
+    1.0 + surface.x1.max(surface.y1) as f32 * 1e-4
+}
+
+/// Whether the end points of `path`'s segments under `m` reach all four sides of `surface` or
+/// beyond: then its pixel bounds are the whole surface whatever its curves do in between, and
+/// the curves off the surface may be left as chords without moving them.
+fn spans(path: &anicraft_geom::Path, m: &Affine, surface: IRect) -> bool {
+    use anicraft_geom::PathCmd;
+    let mut r = Rect::EMPTY;
+    let (mut start, mut last) = (Vec2::ZERO, Vec2::ZERO);
+    for c in &path.cmds {
+        match *c {
+            PathCmd::MoveTo(p) => {
+                start = m.apply(p);
+                last = start;
+            }
+            PathCmd::LineTo(p) | PathCmd::QuadTo(_, p) | PathCmd::CubicTo(_, _, p) => {
+                let p = m.apply(p);
+                // Both ends of a drawn segment are among the flattened points.
+                if last.is_finite() && p.is_finite() {
+                    r.include(last);
+                    r.include(p);
+                }
+                last = p;
+            }
+            PathCmd::Close => last = start,
+        }
+    }
+    r.min.x <= surface.x0 as f32 && r.min.y <= surface.y0 as f32 && r.max.x >= surface.x1 as f32 && r.max.y >= surface.y1 as f32
+}
+
+/// Takes out of each closed polygon the points between two neighbours when all three are
+/// above, below or to the right of `surface` ([`unseen`]): the two edges at such a point add
+/// nothing to any pixel, and neither does the one edge that replaces them, so the pixels are
+/// the same to the last bit with fewer edges to walk. One place at a time: a chord between two
+/// points above the surface is above it, but not one from above it to its right.
+fn drop_unseen(polys: &mut [Vec<Vec2>], surface: IRect) {
+    let (top, bottom, right) = (surface.y0 as f32, surface.y1 as f32, surface.x1 as f32);
+    let places: [&dyn Fn(&Vec2) -> bool; 3] = [&|p| p.y <= top, &|p| p.y >= bottom, &|p| p.x >= right];
+    let mut inside: Vec<bool> = Vec::new();
+    for poly in polys.iter_mut() {
+        for place in places {
+            inside.clear();
+            inside.extend(poly.iter().map(place));
+            if !inside.windows(3).any(|w| w.iter().all(|b| *b)) {
+                continue;
+            }
+            let mut i = 0usize;
+            poly.retain(|_| {
+                let at = i;
+                i += 1;
+                !(at > 0 && inside.get(at - 1..at + 2).is_some_and(|w| w.iter().all(|b| *b)))
+            });
+        }
+    }
+}
+
 /// Turns a display item into fill operations (fill, then stroke), or none when culled. `soft`:
 /// the item is a soft mask's artwork, prepared with its paints like any artwork (still marked
-/// as mask artwork).
-fn prepare(item: &DisplayItem, view: &Affine, surface: IRect, soft: bool) -> Vec<Prepared> {
+/// as mask artwork). `cut`: what can't reach a pixel is left out ([`unseen`]); off, the item is
+/// prepared whole, for the tests that show the pixels are the same.
+fn prepare(item: &DisplayItem, view: &Affine, surface: IRect, soft: bool, cut: bool) -> Vec<Prepared> {
     let mut out = Vec::new();
     let m = view.mul(&item.transform);
     if !m.is_finite() {
@@ -820,7 +904,19 @@ fn prepare(item: &DisplayItem, view: &Affine, surface: IRect, soft: bool) -> Vec
     if bounds.is_empty() || bounds.intersect(&surface_rect).is_empty() {
         return out;
     }
-    let lines = item.path.flatten(&m, TOLERANCE);
+    // Zoomed far into a large filled shape (a drawing merged from many brush strokes), nearly
+    // all of its curves are off the surface: those above, below or right of it become one line
+    // each instead of being cut into pieces nobody sees (ADR 0132). Only where that provably
+    // changes nothing: a fill alone (a stroke's dashes and width follow the length along the
+    // whole line), not a hairline, and a path that spans the surface (see `spans`).
+    let outlined = item.outline.is_some() && item.masks.is_none();
+    let filled_only = !outlined && (is_mask || item.stroke.is_none());
+    let lines = if cut && filled_only && spans(&item.path, &m, surface) {
+        let far = far(surface);
+        item.path.flatten_with(&m, TOLERANCE, |hull| hull.iter().all(|p| p.is_finite()) && unseen(hull, surface, far))
+    } else {
+        item.path.flatten(&m, TOLERANCE)
+    };
     if lines.is_empty() {
         return out;
     }
@@ -849,11 +945,15 @@ fn prepare(item: &DisplayItem, view: &Affine, surface: IRect, soft: bool) -> Vec
         }
         return out;
     }
-    let mut push = |polys: Vec<Vec<Vec2>>, rule, shader: Shader| {
+    let mut push = |mut polys: Vec<Vec<Vec2>>, rule, shader: Shader| {
         if shader.is_solid().is_some_and(|c| c[3] <= 0.0) {
             return;
         }
-        if let Some(b) = pixel_bounds(&polys, surface) {
+        // The bounds first, from every point: they place the coverage buffer.
+        if let Some((b, beyond)) = pixel_bounds_of(&polys, surface) {
+            if cut && beyond {
+                drop_unseen(&mut polys, surface);
+            }
             out.push(Prepared { polys, rule, shader, bounds: b, clip, masks, group, layer: None, hairline: false });
         }
     };
@@ -894,6 +994,12 @@ fn prepare(item: &DisplayItem, view: &Affine, surface: IRect, soft: bool) -> Vec
 }
 
 fn pixel_bounds(polys: &[Vec<Vec2>], surface: IRect) -> Option<IRect> {
+    pixel_bounds_of(polys, surface).map(|(b, _)| b)
+}
+
+/// The pixels of `surface` that `polys` can touch, and whether they reach above, below or
+/// right of it (then some of their points may be [`unseen`]).
+fn pixel_bounds_of(polys: &[Vec<Vec2>], surface: IRect) -> Option<(IRect, bool)> {
     let mut r = Rect::EMPTY;
     for p in polys.iter().flatten() {
         r.include(*p);
@@ -907,7 +1013,8 @@ fn pixel_bounds(polys: &[Vec<Vec2>], surface: IRect) -> Option<IRect> {
         x1: (r.max.x.ceil().min(surface.x1 as f32)) as i32,
         y1: (r.max.y.ceil().min(surface.y1 as f32)) as i32,
     };
-    (!b.is_empty()).then_some(b)
+    let beyond = r.min.y <= surface.y0 as f32 || r.max.y >= surface.y1 as f32 || r.max.x >= surface.x1 as f32;
+    (!b.is_empty()).then_some((b, beyond))
 }
 
 /// Composites coverage `cov` (over `b`) of `op` into the band whose first row is `band_y0`,
@@ -951,6 +1058,11 @@ fn composite(cov: &Coverage, op: &Prepared, b: IRect, band_y0: i32, w: usize, ro
 mod nine_slice_tests;
 
 #[cfg(test)]
+mod layer_opacity_tests;
+#[cfg(test)]
+mod cut_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use anicraft_doc::{ElementId, LayerId, sample};
@@ -979,7 +1091,7 @@ mod tests {
     }
 
     fn list(items: Vec<DisplayItem>) -> DisplayList {
-        DisplayList { clip_modes: Vec::new(), items, clip_parents: Vec::new(), groups: Vec::new() }
+        DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items, clip_parents: Vec::new(), groups: Vec::new() }
     }
 
     /// A 40 × 40 opaque blue square masked by `art` in `mode`, on transparent.
@@ -1074,7 +1186,7 @@ mod tests {
         let mut mask = item(Path::ellipse(20.0, 20.0, 10.0, 10.0), Paint::Solid(Rgba::new(1.0, 0.0, 0.0, 0.2)));
         mask.masks = Some(0);
         mask.stroke = Some(anicraft_doc::Stroke::new(Rgba::BLACK, 8.0));
-        let dl = DisplayList { clip_modes: Vec::new(), items: vec![square, mask], clip_parents: vec![None], groups: Vec::new() };
+        let dl = DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items: vec![square, mask], clip_parents: vec![None], groups: Vec::new() };
         let (pm, _) = render(&dl, &view(40, 40)).unwrap();
         // Pixel for pixel, the same as the circle drawn in the square's colour.
         let circle = item(Path::ellipse(20.0, 20.0, 10.0, 10.0), Paint::Solid(Rgba::new(0.0, 0.0, 1.0, 1.0)));
@@ -1142,7 +1254,7 @@ mod tests {
         let mut blue = item(Path::rect(4.0, 0.0, 8.0, 4.0), Paint::Solid(Rgba::new(0.0, 0.0, 1.0, 1.0)));
         red.group = Some(0);
         blue.group = Some(0);
-        let grouped = DisplayList { clip_modes: Vec::new(), items: vec![red.clone(), blue.clone()], clip_parents: vec![], groups: vec![anicraft_doc::Group { parent: None, alpha: 0.5, blend: Default::default(), filters: Default::default(), clip: None }] };
+        let grouped = DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items: vec![red.clone(), blue.clone()], clip_parents: vec![], groups: vec![anicraft_doc::Group { parent: None, alpha: 0.5, blend: Default::default(), filters: Default::default(), clip: None }] };
         let (pm, _) = render(&grouped, &white).unwrap();
         let near = |p: Premul, q: [f32; 4]| p.iter().zip(q).all(|(a, b)| (a - b).abs() < 1e-4);
         // In the overlap only the top square shows through: half blue, half white, no red.
@@ -1158,7 +1270,7 @@ mod tests {
         // Nested groups multiply; a group with a bad parent link is a top-level group.
         let mut inner = item(Path::rect(0.0, 0.0, 12.0, 4.0), Paint::Solid(Rgba::BLACK));
         inner.group = Some(1);
-        let nested = DisplayList {
+        let nested = DisplayList { left_out: false, links: Vec::new(),
             clip_modes: Vec::new(),
             items: vec![inner],
             clip_parents: vec![],
@@ -1173,7 +1285,7 @@ mod tests {
         // Spanning several render bands changes nothing.
         let mut tall = item(Path::rect(0.0, 0.0, 4.0, 100.0), Paint::Solid(Rgba::BLACK));
         tall.group = Some(0);
-        let (t, _) = render(&DisplayList { clip_modes: Vec::new(), items: vec![tall], clip_parents: vec![], groups: vec![anicraft_doc::Group { parent: None, alpha: 0.25, blend: Default::default(), filters: Default::default(), clip: None }] }, &View { background: Some(Rgba::WHITE), ..view(4, 100) }).unwrap();
+        let (t, _) = render(&DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items: vec![tall], clip_parents: vec![], groups: vec![anicraft_doc::Group { parent: None, alpha: 0.25, blend: Default::default(), filters: Default::default(), clip: None }] }, &View { background: Some(Rgba::WHITE), ..view(4, 100) }).unwrap();
         assert!((0..100).all(|y| near(t.pixel(1, y).unwrap(), [0.75, 0.75, 0.75, 1.0])));
     }
 
@@ -1203,7 +1315,7 @@ mod tests {
         inner.masks = Some(1);
         let mut lost = clipped.clone();
         lost.clip = Some(2);
-        let dl = DisplayList { clip_modes: Vec::new(), items: vec![clipped, outer, inner, lost], clip_parents: vec![None, Some(0), Some(9)], groups: Vec::new() };
+        let dl = DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items: vec![clipped, outer, inner, lost], clip_parents: vec![None, Some(0), Some(9)], groups: Vec::new() };
         let (scene, st) = prepare_scene(&dl, &view(16, 16)).unwrap();
         let (_, rst) = render(&dl, &view(16, 16)).unwrap();
         assert_eq!((st.drawn, st.edges, st.pixels_touched), (rst.drawn, rst.edges, rst.pixels_touched));
@@ -1216,7 +1328,7 @@ mod tests {
         let mut grouped = sq.clone();
         grouped.group = Some(1);
         let g = |parent, alpha| anicraft_doc::Group { parent, alpha, blend: BlendMode::Multiply, filters: Default::default(), clip: None };
-        let dl = DisplayList { clip_modes: Vec::new(), items: vec![grouped], clip_parents: vec![], groups: vec![g(None, 2.0), g(Some(0), f32::NAN)] };
+        let dl = DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items: vec![grouped], clip_parents: vec![], groups: vec![g(None, 2.0), g(Some(0), f32::NAN)] };
         let (scene, _) = prepare_scene(&dl, &view(16, 16)).unwrap();
         assert!(scene.fills.iter().all(|f| f.group == Some(1)));
         assert_eq!((scene.groups[1].chain.clone(), scene.groups[0].alpha, scene.groups[1].alpha, scene.groups[1].blend), (vec![0, 1], 1.0, 1.0, BlendMode::Multiply));
@@ -1258,7 +1370,7 @@ mod tests {
         let mut clipped = item(Path::rect(0.0, 0.0, 8.0, 8.0), Paint::Solid(Rgba::BLACK));
         clipped.clip = Some(0);
         let free = item(Path::rect(0.0, 0.0, 2.0, 2.0), Paint::Solid(Rgba::BLACK));
-        let (pm, st) = render(&DisplayList { clip_modes: Vec::new(), items: vec![clipped, free.clone()], clip_parents: vec![None], groups: Vec::new() }, &view(8, 8)).unwrap();
+        let (pm, st) = render(&DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items: vec![clipped, free.clone()], clip_parents: vec![None], groups: Vec::new() }, &view(8, 8)).unwrap();
         assert_eq!(st.drawn, 1);
         assert_eq!(pm, render(&list(vec![free]), &view(8, 8)).unwrap().0);
     }
@@ -1273,11 +1385,11 @@ mod tests {
         inner.masks = Some(1);
         let items = vec![fill, outer, inner];
         // Clip 1 lies inside clip 0: a 32 × 32 square across two render bands survives.
-        let (pm, _) = render(&DisplayList { clip_modes: Vec::new(), items: items.clone(), clip_parents: vec![None, Some(0)], groups: Vec::new() }, &view(64, 64)).unwrap();
+        let (pm, _) = render(&DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items: items.clone(), clip_parents: vec![None, Some(0)], groups: Vec::new() }, &view(64, 64)).unwrap();
         assert!((alpha_sum(&pm) - 32.0 * 32.0).abs() < 1e-2, "{}", alpha_sum(&pm));
         // A parent link pointing forward (malformed) or out of range masks everything out.
         for parents in [vec![Some(1), Some(1)], vec![None, Some(9)]] {
-            let (pm, _) = render(&DisplayList { clip_modes: Vec::new(), items: items.clone(), clip_parents: parents, groups: Vec::new() }, &view(64, 64)).unwrap();
+            let (pm, _) = render(&DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items: items.clone(), clip_parents: parents, groups: Vec::new() }, &view(64, 64)).unwrap();
             assert_eq!(alpha_sum(&pm), 0.0);
         }
     }
@@ -1499,7 +1611,7 @@ mod tests {
         let bg = item(Path::rect(0.0, 0.0, 20.0, 10.0), Paint::Solid(Rgba::new(0.5, 0.5, 1.0, 1.0)));
         let mut top = item(Path::rect(0.0, 0.0, 10.0, 10.0), Paint::Solid(Rgba::new(1.0, 0.0, 0.0, 1.0)));
         top.group = Some(0);
-        let dl = DisplayList { clip_modes: Vec::new(), items: vec![bg, top], clip_parents: vec![], groups: vec![anicraft_doc::Group { parent: None, alpha: 1.0, blend: BlendMode::Multiply, filters: Default::default(), clip: None }] };
+        let dl = DisplayList { left_out: false, links: Vec::new(), clip_modes: Vec::new(), items: vec![bg, top], clip_parents: vec![], groups: vec![anicraft_doc::Group { parent: None, alpha: 1.0, blend: BlendMode::Multiply, filters: Default::default(), clip: None }] };
         let (pm, _) = render(&dl, &View { background: Some(Rgba::WHITE), ..view(20, 10) }).unwrap();
         let p = pm.pixel(5, 5).unwrap();
         assert!((p[0] - 0.5).abs() < 1e-3 && p[1].abs() < 1e-3 && p[2].abs() < 1e-3, "red × lavender: {p:?}");

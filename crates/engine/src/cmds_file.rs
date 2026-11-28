@@ -1,5 +1,6 @@
 //! File, edit-history and document commands.
 
+use crate::left_out::LeftOut;
 use crate::params::*;
 use crate::{CommandSpec, EngineError, Result, Session, format};
 use anicraft_doc::{Document, MAX_STAGE_EDGE, Stage, sample};
@@ -12,7 +13,7 @@ use std::sync::Arc;
 pub fn specs() -> Vec<CommandSpec> {
     let mut v = vec![
         CommandSpec { id: "file.new", label: "New", menu: "File", shortcut: Some("Ctrl+N"), params: "{width?, height?, fps?}", mutates: false, run: new_doc },
-        CommandSpec { id: "file.new_sample", label: "New from Sample", menu: "File", shortcut: None, params: "{which?: demo (default) | interactive (a menu with a Play button, for Test Movie)}", mutates: false, run: new_sample },
+        CommandSpec { id: "file.new_sample", label: "New from Sample", menu: "File", shortcut: None, params: "{which?: demo (default) | interactive (a menu with a Play button, for Test Movie) | arm (three parented layers, ADR 0113)}", mutates: false, run: new_sample },
         CommandSpec { id: "file.open", label: "Open…", menu: "File", shortcut: Some("Ctrl+O"), params: "{path, unsaved? (opens it as unsaved work: a restored copy), untitled? (with no file name, so Save asks for one)}", mutates: false, run: open },
         CommandSpec { id: "file.save", label: "Save", menu: "File", shortcut: Some("Ctrl+S"), params: "{path?, confirm?}", mutates: false, run: save },
         CommandSpec {
@@ -27,13 +28,13 @@ pub fn specs() -> Vec<CommandSpec> {
                 save(s, p)
             },
         },
-        CommandSpec { id: "file.export_png", label: "Export Frame as PNG…", menu: "File/Export", shortcut: None, params: "{path, frame? (in the current scene), scale?}", mutates: false, run: export_png },
+        CommandSpec { id: "file.export_png", label: "Export Frame as PNG…", menu: "File/Export", shortcut: None, params: "{path, frame? (in the current scene), scale?, background? (default true: the stage colour; false: transparent)}", mutates: false, run: export_png },
         CommandSpec {
             id: "file.import",
             label: "Import to Stage…",
             menu: "File/Import",
             shortcut: Some("Ctrl+R"),
-            params: "{path (.svg, .png, .jpg; or a .wav, .ogg or .mp3 sound: onto a new layer at the playhead), x?, y? (top-left on the stage; default: centred), cx?, cy? (centred on that point instead), layer? (new (default) | active: a one-layer drawing goes into the active layer's keyframe at the playhead)}",
+            params: "{path (.svg, .png, .jpg; or a .wav, .ogg or .mp3 sound: onto a new layer at the playhead), x?, y? (top-left on the stage; default: centred), cx?, cy? (centred on that point instead), layer? (new (default) | active: a one-layer drawing goes into the active layer's keyframe at the playhead), match_stage?: false (SVG only: set the stage to the SVG size rounded up to whole pixels, and place it at the origin unless coordinates are given)}",
             mutates: true,
             run: import_to_stage,
         },
@@ -61,9 +62,18 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Export PNG Sequence…",
             menu: "File/Export",
             shortcut: None,
-            params: "{dir, from?, to? (movie frames: every scene in order), scale?}",
+            params: "{dir, from?, to? (movie frames: every scene in order), scale?, background? (default true: the stage colour; false: transparent)}",
             mutates: false,
             run: export_sequence,
+        },
+        CommandSpec {
+            id: "file.export_svg_sequence",
+            label: "Export SVG Sequence…",
+            menu: "File/Export",
+            shortcut: None,
+            params: "{dir, from?, to? (movie frames: every scene in order), confirm?} → one frame_00001.svg per frame (vectors, gradients and masks kept)",
+            mutates: false,
+            run: export_svg_sequence,
         },
         CommandSpec {
             id: "file.export_gif",
@@ -116,7 +126,7 @@ pub fn specs() -> Vec<CommandSpec> {
             id: "doc.set_stage",
             label: "Document Settings",
             menu: "Modify",
-            shortcut: None,
+            shortcut: Some("Ctrl+J"),
             params: "{width?, height?, fps?, background?: \"#rrggbb\"}",
             mutates: true,
             run: set_stage,
@@ -167,10 +177,60 @@ fn new_sample(s: &mut Session, p: &Value) -> Result<Value> {
     let doc = match opt_str(p, "which")? {
         None | Some("demo") => sample::demo(),
         Some("interactive") => sample::interactive(),
-        Some(other) => return Err(EngineError::Param(format!("unknown sample '{other}' (demo or interactive)"))),
+        Some("arm") => sample::arm(),
+        Some(other) => return Err(EngineError::Param(format!("unknown sample '{other}' (demo, interactive or arm)"))),
     };
     s.replace_document(doc, None);
     Ok(json!({"frames": s.frame_count()}))
+}
+
+/// Where an untitled document came from (ADR 0009), settled when it was imported, so a later
+/// change on disk (a package's files moved or removed) never changes what it is called or where
+/// Save suggests keeping it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Import {
+    /// What was opened: the `.fla`, the `.xfl` or the XFL folder. Its name names the document.
+    pub source: PathBuf,
+    /// The Animate document itself: the XFL folder, whether it or the `.xfl` in it was opened,
+    /// or the `.fla`. Two imports of the same package are the same document.
+    pub package: PathBuf,
+    /// Where Save first suggests keeping it: an `.anicraft` of the same name beside the
+    /// package, so `walk.fla` suggests `walk.anicraft` in its folder, and an XFL folder's goes
+    /// beside the folder, never inside it.
+    pub save_as: PathBuf,
+}
+
+impl Import {
+    /// The import of `source`, as the disk has it now.
+    pub fn of(source: &std::path::Path) -> Import {
+        let package = import_package(source);
+        // "." or "walk/sub/.." has no name of its own: resolve it, or the suggestion would land
+        // inside the package as "animation.anicraft".
+        let package = match package.file_name() {
+            Some(_) => package,
+            None => crate::vfs::canonicalize(&package).unwrap_or(package),
+        };
+        // A folder's whole name ("walk.v2" stays "walk.v2"); a file's without its extension.
+        let name = if crate::vfs::is_dir(&package) { package.file_name() } else { package.file_stem() };
+        let name = name.map_or_else(|| "animation".to_string(), |n| n.to_string_lossy().into_owned());
+        let save_as = package.with_file_name(format!("{name}.anicraft"));
+        Import { source: source.to_path_buf(), package, save_as }
+    }
+}
+
+/// The Animate document `path` opens: the XFL folder for the `.xfl` file in one, else `path`
+/// itself (a `.fla`, an XFL folder, or any other file).
+pub fn import_package(path: &std::path::Path) -> PathBuf {
+    // A folder named "x.xfl" is a package of its own, not part of the one around it.
+    let xfl_file = crate::vfs::is_file(path)
+        && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("xfl"))
+        && path.parent().is_some_and(|d| crate::vfs::is_file(&d.join("DOMDocument.xml")));
+    match path.parent() {
+        // A bare "walk.xfl" is in the current folder: "." resolves, an empty path doesn't.
+        Some(folder) if xfl_file && folder.as_os_str().is_empty() => PathBuf::from("."),
+        Some(folder) if xfl_file => folder.to_path_buf(),
+        _ => path.to_path_buf(),
+    }
 }
 
 /// Whether `path` is an Animate document: a `.fla` archive, an `.xfl` file or an XFL folder.
@@ -184,36 +244,55 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     let unsaved = opt_bool(p, "unsaved")?.unwrap_or(false);
     let untitled = opt_bool(p, "untitled")?.unwrap_or(false);
     if is_animate(&path) {
-        // Imported, not adopted: the document is untitled, so Save asks for a new .anicraft
-        // name and never writes over the Animate file.
+        // Imported, not adopted: the document has no file name, so Save asks for a new
+        // .anicraft name and never writes over the Animate file. It is still called by the
+        // Animate file's name, and Save suggests one beside it (ADR 0009).
         let fla = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("fla")) && crate::vfs::is_file(&path);
-        let imported = if fla {
-            // Through `vfs`, so an archive the browser handed over opens too (ADR 0036).
-            if crate::vfs::len(&path)? > anicraft_xfl::MAX_FLA_BYTES {
-                return Err(EngineError::Format(format!("{} is too large to open", path.display())));
+        // (document, report JSON fields) — the XFL and legacy-FLA importers share the
+        // report's shape, so the open path surfaces both alike.
+        type ImportedDoc = (anicraft_doc::Document, String, serde_json::Value, serde_json::Value, serde_json::Value, serde_json::Value, serde_json::Value);
+        let imported: Result<ImportedDoc> = if fla {
+            // Through `vfs`, so an archive the browser handed over opens too (ADR 0036). The
+            // size is checked before reading, and the read stops past the limit, so a file
+            // that grows in between is refused too.
+            let max = anicraft_xfl::MAX_FLA_BYTES;
+            let data = if crate::vfs::len(&path)? > max { None } else { Some(crate::vfs::read_bounded(&path, max)?).filter(|d| d.len() as u64 <= max) };
+            match data {
+                None => Err(EngineError::Format(format!("{} is too large to open", path.display()))),
+                // The Flash 8–CS4 era compound binary (ADR 0120).
+                Some(data) if anicraft_fla::is_legacy(&data) => anicraft_fla::import(&data)
+                    .map(|(d, r)| (d, r.summary(), json!(r.skipped), json!(r.kept), json!(r.runs), json!(r.missing_fonts), json!(r.names)))
+                    .map_err(|e| EngineError::Format(format!("{}: {e}", path.display()))),
+                Some(data) => anicraft_xfl::import_fla(&data)
+                    .map(|(d, r)| (d, r.summary(), json!(r.skipped), json!(r.kept), json!(r.runs), json!(r.missing_fonts), json!(r.names)))
+                    .map_err(|e| EngineError::Format(format!("{}: {e}", path.display()))),
             }
-            anicraft_xfl::import_fla(&crate::vfs::read(&path)?)
         } else if crate::vfs::in_memory() {
-            return Err(EngineError::Param("an XFL document is a folder, which a web browser can't hand over: open the .fla instead".into()));
+            Err(EngineError::Param("an XFL document is a folder, which a web browser can't hand over: open the .fla instead".into()))
         } else {
+            // The XFL reader opens the folder's files itself (ADR 0124).
+            crate::access::check(&path, crate::access::Access::Read)?;
             anicraft_xfl::import_path(&path)
+                .map(|(d, r)| (d, r.summary(), json!(r.skipped), json!(r.kept), json!(r.runs), json!(r.missing_fonts), json!(r.names)))
+                .map_err(|e| EngineError::Format(format!("{}: {e}", path.display())))
         };
-        let (mut doc, report) = imported.map_err(|e| EngineError::Format(format!("{}: {e}", path.display())))?;
+        let (mut doc, summary, skipped, kept, runs, missing_fonts, named) = imported?;
         // Raw artwork arrives one shape per style: each keyframe's becomes one merged drawing,
         // as it was in Animate (ADR 0042).
         let merged = crate::merge::merge_document(&mut doc);
         s.replace_document(doc, None);
+        s.imported = Some(Import::of(&path));
         // Open Recent reopens the Animate file (ADR 0059).
         s.recent.add(&path);
+        // `imported` and `save_as` come with the session's info.
         let mut info = s.info();
-        info["imported"] = json!(path.display().to_string());
-        info["report"] = json!(report.summary());
-        info["skipped"] = json!(report.skipped);
-        info["kept"] = json!(report.kept);
-        info["runs"] = json!(report.runs);
-        info["missing_fonts"] = json!(report.missing_fonts);
+        info["report"] = json!(summary);
+        info["skipped"] = skipped;
+        info["kept"] = kept;
+        info["runs"] = runs;
+        info["missing_fonts"] = missing_fonts;
         // The sounds and videos that didn't come across, by name and why (ADR 0086).
-        info["named"] = json!(report.names);
+        info["named"] = named;
         info["merged_keyframes"] = json!(merged);
         return Ok(info);
     }
@@ -234,6 +313,8 @@ fn save(s: &mut Session, p: &Value) -> Result<Value> {
     };
     format::save(&s.doc, &path)?;
     s.path = Some(path.clone());
+    // Saved: the document is the .anicraft file now, not the import.
+    s.imported = None;
     s.mark_saved();
     s.recent.add(&path);
     Ok(json!({"saved": path.display().to_string()}))
@@ -249,8 +330,19 @@ pub(crate) fn scale_param(p: &Value) -> Result<f32> {
 
 /// Renders movie frame `frame` (scenes in order) of `doc` to PNG bytes.
 pub fn render_png(doc: &Document, frame: u32, scale: f32) -> Result<Vec<u8>> {
-    let dl = anicraft_doc::evaluate(doc, frame);
-    let (pm, _) = render(&dl, &View::stage(doc, scale))?;
+    render_png_noting(doc, frame, scale, true, &LeftOut::default())
+}
+
+/// [`render_png`], noting in `cut` a frame whose artwork was left out (ADR 0128), with the
+/// stage colour behind the frame or (`background` false) nothing: a transparent PNG with real
+/// alpha (#536).
+pub fn render_png_noting(doc: &Document, frame: u32, scale: f32, background: bool, cut: &LeftOut) -> Result<Vec<u8>> {
+    let dl = cut.evaluate(doc, frame);
+    let mut view = View::stage(doc, scale);
+    if !background {
+        view.background = None;
+    }
+    let (pm, _) = render(&dl, &view)?;
     Ok(pm.encode_png()?)
 }
 
@@ -258,13 +350,15 @@ fn export_png(s: &mut Session, p: &Value) -> Result<Value> {
     let path = PathBuf::from(str_req(p, "path")?);
     let frame = opt_u32(p, "frame")?.unwrap_or(s.frame);
     // `frame` is within the current scene; the renderer takes movie frames.
-    let bytes = render_png(&s.doc, s.doc.scene_start(s.scene).saturating_add(frame), scale_param(p)?)?;
+    let cut = LeftOut::default();
+    let background = opt_bool(p, "background")?.unwrap_or(true);
+    let bytes = render_png_noting(&s.doc, s.doc.scene_start(s.scene).saturating_add(frame), scale_param(p)?, background, &cut)?;
     crate::vfs::write(&path, &bytes)?;
-    Ok(json!({"written": path.display().to_string(), "bytes": bytes.len(), "frame": frame}))
+    Ok(cut.noted(json!({"written": path.display().to_string(), "bytes": bytes.len(), "frame": frame})))
 }
 
 /// Largest file Import to Stage reads.
-const MAX_IMPORT_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_IMPORT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Import to Stage: the drawing's shapes and text become editable elements on a new layer
 /// named after the file, in a keyframe at the playhead, selected, as one undo step. A drawing
@@ -272,10 +366,14 @@ const MAX_IMPORT_BYTES: u64 = 256 * 1024 * 1024;
 /// artwork they clip (ADR 0021). Centred on the stage unless `x`/`y` give its top-left corner.
 pub(crate) fn import_to_stage(s: &mut Session, p: &Value) -> Result<Value> {
     let path = PathBuf::from(str_req(p, "path")?);
+    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+    let match_stage = opt_bool(p, "match_stage")?.unwrap_or(false);
+    if match_stage && ext.as_deref() != Some("svg") {
+        return Err(EngineError::Param("match_stage is only available for SVG drawings".into()));
+    }
     if crate::cmds_sound::is_sound(&path) {
         return crate::cmds_sound::import_to_stage(s, &path);
     }
-    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
     if !matches!(ext.as_deref(), Some("svg" | "png" | "jpg" | "jpeg")) {
         return Err(EngineError::Param("Import to Stage reads SVG drawings, PNG or JPEG images, and WAV, Ogg Vorbis or MP3 sounds".into()));
     }
@@ -293,15 +391,22 @@ pub(crate) fn import_to_stage(s: &mut Session, p: &Value) -> Result<Value> {
     if drawing.is_empty() {
         return Err(EngineError::State(format!("{} has no shapes AniCraft can import yet. {}", path.display(), drawing.report.summary())));
     }
-    let stage = s.doc.stage;
+    let mut stage = s.doc.stage;
+    let (default_x, default_y) = if match_stage {
+        stage.width = svg_stage_edge(drawing.width)?;
+        stage.height = svg_stage_edge(drawing.height)?;
+        (0.0, 0.0)
+    } else {
+        ((stage.width as f32 - drawing.width) * 0.5, (stage.height as f32 - drawing.height) * 0.5)
+    };
     // `cx`/`cy` centre it on a point (a drop, ADR 0059); `x`/`y` give its top-left corner.
     let x = match opt_f32(p, "cx")? {
         Some(cx) => cx - drawing.width * 0.5,
-        None => opt_f32(p, "x")?.unwrap_or((stage.width as f32 - drawing.width) * 0.5),
+        None => opt_f32(p, "x")?.unwrap_or(default_x),
     };
     let y = match opt_f32(p, "cy")? {
         Some(cy) => cy - drawing.height * 0.5,
-        None => opt_f32(p, "y")?.unwrap_or((stage.height as f32 - drawing.height) * 0.5),
+        None => opt_f32(p, "y")?.unwrap_or(default_y),
     };
     let onto_active = match opt_str(p, "layer")? {
         None | Some("new") => false,
@@ -408,6 +513,9 @@ pub(crate) fn import_to_stage(s: &mut Session, p: &Value) -> Result<Value> {
         s.layer = lid;
         (lid, ids, made, Some(fid.0))
     };
+    if match_stage {
+        s.doc.stage = stage;
+    }
     s.select_only(ids.iter().copied());
     Ok(json!({
         "layer": layer_id.0,
@@ -423,6 +531,16 @@ pub(crate) fn import_to_stage(s: &mut Session, p: &Value) -> Result<Value> {
         "skipped": report.skipped,
         "missing_fonts": report.missing_fonts,
     }))
+}
+
+/// A stage has whole-pixel edges. Round up so the imported drawing fits at its original scale.
+fn svg_stage_edge(pixels: f32) -> Result<u32> {
+    let edge = pixels.ceil();
+    if (1.0..=MAX_STAGE_EDGE as f32).contains(&edge) {
+        Ok(edge as u32)
+    } else {
+        Err(EngineError::Param(format!("the SVG size must fit a stage of up to {MAX_STAGE_EDGE} pixels per edge")))
+    }
 }
 
 /// An SVG drawing read from `path` (size-checked), with at least one shape.
@@ -512,20 +630,28 @@ fn import_image(s: &mut Session, path: &std::path::Path, bytes: Vec<u8>) -> Resu
     Ok(anicraft_svg::SvgImport::single(w, h, vec![anicraft_svg::ImportedElement { name, transform: anicraft_geom::Affine::IDENTITY, alpha: 1.0, kind: anicraft_doc::ElementKind::Shape(shape) }]))
 }
 
-/// Movie frame `frame` as a standalone SVG document (vectors, gradients and masks kept).
+/// [`frame_svg_noting`] for a frame known to be whole: what tests compare a written file with.
+#[cfg(test)]
 pub fn frame_svg(doc: &Document, frame: u32) -> String {
-    anicraft_render::svg::to_svg(&anicraft_doc::evaluate(doc, frame), &doc.stage)
+    frame_svg_noting(doc, frame, &LeftOut::default())
+}
+
+/// Movie frame `frame` as a standalone SVG document (vectors, gradients and masks kept),
+/// noting in `cut` a frame whose artwork was left out (ADR 0128).
+pub fn frame_svg_noting(doc: &Document, frame: u32, cut: &LeftOut) -> String {
+    anicraft_render::svg::to_svg(&cut.evaluate(doc, frame), &doc.stage)
 }
 
 fn export_svg(s: &mut Session, p: &Value) -> Result<Value> {
     let path = PathBuf::from(str_req(p, "path")?);
     let frame = opt_u32(p, "frame")?.unwrap_or(s.frame);
     if frame >= s.frame_count() {
-        return Err(EngineError::Param(format!("frame {} is past the end (the timeline has {} frames)", frame + 1, s.frame_count())));
+        return Err(EngineError::Param(format!("frame {} is past the end (the timeline has {} frames)", u64::from(frame) + 1, s.frame_count())));
     }
-    let svg = frame_svg(&s.doc, s.doc.scene_start(s.scene).saturating_add(frame));
+    let cut = LeftOut::default();
+    let svg = frame_svg_noting(&s.doc, s.doc.scene_start(s.scene).saturating_add(frame), &cut);
     crate::vfs::write(&path, svg.as_bytes())?;
-    Ok(json!({"written": path.display().to_string(), "bytes": svg.len(), "frame": frame}))
+    Ok(cut.noted(json!({"written": path.display().to_string(), "bytes": svg.len(), "frame": frame})))
 }
 
 /// Export Sprite Sheet: movie frames in a grid on one PNG (transparent unless `background`),
@@ -566,10 +692,11 @@ fn export_sprite_sheet(s: &mut Session, p: &Value) -> Result<Value> {
     let doc = &s.doc;
     // A publish counts the frames, and stops between them when cancelled (ADR 0060).
     let job = s.job.as_deref();
+    let cut = LeftOut::default();
     let frames: Vec<anicraft_render::Pixmap> = (from..=to)
         .into_par_iter()
         .map(|f| {
-            let (pm, _) = render(&anicraft_doc::evaluate(doc, f), &view)?;
+            let (pm, _) = render(&cut.evaluate(doc, f), &view)?;
             crate::publish::tick(job, 1)?;
             Ok(pm)
         })
@@ -619,15 +746,12 @@ fn export_sprite_sheet(s: &mut Session, p: &Value) -> Result<Value> {
     let text = serde_json::to_string_pretty(&atlas).map_err(|e| EngineError::Format(e.to_string()))?;
     crate::vfs::write(&path, &png)?;
     crate::vfs::write(&json_path, text)?;
-    Ok(json!({"written": path.display().to_string(), "map": json_path.display().to_string(), "frames": n, "columns": cols, "rows": rows, "width": sheet_w, "height": sheet_h}))
+    Ok(cut.noted(json!({"written": path.display().to_string(), "map": json_path.display().to_string(), "frames": n, "columns": cols, "rows": rows, "width": sheet_w, "height": sheet_h})))
 }
 
 /// The ffmpeg to run: `ffmpeg` param, else `ANICRAFT_FFMPEG`, else `ffmpeg` on the PATH.
-fn ffmpeg_program(p: &Value) -> Result<std::ffi::OsString> {
-    if let Some(x) = opt_str(p, "ffmpeg")?.filter(|x| !x.trim().is_empty()) {
-        return Ok(x.into());
-    }
-    Ok(std::env::var_os("ANICRAFT_FFMPEG").filter(|x| !x.is_empty()).unwrap_or_else(|| "ffmpeg".into()))
+pub(crate) fn ffmpeg_program(p: &Value) -> Result<std::ffi::OsString> {
+    Ok(crate::video::program(opt_str(p, "ffmpeg")?))
 }
 
 /// Export Video: movie frames streamed in order to the user's own ffmpeg (AniCraft bundles no
@@ -641,6 +765,8 @@ fn export_video(s: &mut Session, p: &Value) -> Result<Value> {
         // ffmpeg writes the file itself, and a web browser can't start it (ADR 0036).
         return Err(EngineError::State("video export runs ffmpeg, which can't run in a web browser: export an animated GIF, a PNG sequence or an HTML page instead".into()));
     }
+    // ffmpeg writes the file, not `vfs`: the automation roots are asked here (ADR 0124).
+    let path = crate::access::for_program(&path, crate::access::Access::Write)?;
     let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
     // Sound is encoded by the same ffmpeg: Opus in WebM (royalty-free), AAC in MP4.
     let (codec, audio_codec): (&[&str], &[&str]) = match ext.as_deref() {
@@ -703,11 +829,12 @@ fn export_video(s: &mut Session, p: &Value) -> Result<Value> {
     let doc = &s.doc;
     let job = s.job.as_deref();
     let mut written = 0u32;
+    let cut = LeftOut::default();
     let mut failure: Option<EngineError> = None;
     if let Some(mut stdin) = child.stdin.take() {
         let frames: Vec<u32> = (from..=to).collect();
         'batches: for batch in frames.chunks(8) {
-            let images: Vec<Vec<u8>> = match batch.par_iter().map(|&f| render(&anicraft_doc::evaluate(doc, f), &view).map(|(pm, _)| pm.to_rgba8())).collect::<std::result::Result<_, _>>() {
+            let images: Vec<Vec<u8>> = match batch.par_iter().map(|&f| render(&cut.evaluate(doc, f), &view).map(|(pm, _)| pm.to_rgba8())).collect::<std::result::Result<_, _>>() {
                 Ok(v) => v,
                 Err(e) => {
                     failure = Some(e.into());
@@ -743,7 +870,7 @@ fn export_video(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::Format(format!("ffmpeg could not make the video ({status}): {}", if tail.is_empty() { "no message".to_string() } else { tail.join(" | ") })));
     }
     let bytes = crate::vfs::len(&path).unwrap_or(0);
-    Ok(json!({"written": path.display().to_string(), "frames": written, "bytes": bytes, "width": w, "height": h, "fps": fps, "audio": track.is_some()}))
+    Ok(cut.noted(json!({"written": path.display().to_string(), "frames": written, "bytes": bytes, "width": w, "height": h, "fps": fps, "audio": track.is_some()})))
 }
 
 fn export_sequence(s: &mut Session, p: &Value) -> Result<Value> {
@@ -756,6 +883,7 @@ fn export_sequence(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::Param("'to' must not be before 'from'".into()));
     }
     let scale = scale_param(p)?;
+    let background = opt_bool(p, "background")?.unwrap_or(true);
     crate::vfs::create_dir_all(&dir)?;
     // Frames are independent: render and encode them in parallel (each render is itself
     // row-parallel; rayon balances both levels), a batch at a time so memory stays bounded.
@@ -764,16 +892,48 @@ fn export_sequence(s: &mut Session, p: &Value) -> Result<Value> {
     let doc = &s.doc;
     let job = s.job.as_deref();
     let mut files = 0usize;
+    let cut = LeftOut::default();
     let frames: Vec<u32> = (from..=to).collect();
     for batch in frames.chunks(64) {
-        let pngs = batch.par_iter().map(|&f| render_png(doc, f, scale)).collect::<Result<Vec<_>>>()?;
+        let pngs = batch.par_iter().map(|&f| render_png_noting(doc, f, scale, background, &cut)).collect::<Result<Vec<_>>>()?;
         for (f, png) in batch.iter().zip(pngs) {
             crate::vfs::write(&dir.join(format!("frame_{:05}.png", f + 1)), png)?;
             files += 1;
         }
         crate::publish::tick(job, batch.len() as u64)?;
     }
-    Ok(json!({"frames": files, "dir": dir.display().to_string()}))
+    Ok(cut.noted(json!({"frames": files, "dir": dir.display().to_string()})))
+}
+
+/// Export SVG Sequence (#504): every movie frame as its own SVG file, named like the PNG
+/// sequence's (`frame_00001.svg`), so other programs read the animation as vectors. Each file
+/// is what Export Frame as SVG writes for that frame.
+fn export_svg_sequence(s: &mut Session, p: &Value) -> Result<Value> {
+    let dir = PathBuf::from(str_req(p, "dir")?);
+    let last = s.doc.frame_count().saturating_sub(1);
+    let from = opt_u32(p, "from")?.unwrap_or(0).min(last);
+    let to = opt_u32(p, "to")?.unwrap_or(last).min(last);
+    if to < from {
+        return Err(EngineError::Param("'to' must not be before 'from'".into()));
+    }
+    crate::vfs::create_dir_all(&dir)?;
+    // Frames are independent: a small batch at a time in parallel, so the text held in memory
+    // stays bounded, written here on the command's thread (ADR 0036).
+    let doc = &s.doc;
+    let job = s.job.as_deref();
+    let (mut files, mut bytes) = (0usize, 0u64);
+    let cut = LeftOut::default();
+    let frames: Vec<u32> = (from..=to).collect();
+    for batch in frames.chunks(16) {
+        let svgs: Vec<String> = batch.par_iter().map(|&f| frame_svg_noting(doc, f, &cut)).collect();
+        for (f, svg) in batch.iter().zip(svgs) {
+            bytes = bytes.saturating_add(svg.len() as u64);
+            crate::vfs::write(&dir.join(format!("frame_{:05}.svg", f + 1)), svg.as_bytes())?;
+            files += 1;
+        }
+        crate::publish::tick(job, batch.len() as u64)?;
+    }
+    Ok(cut.noted(json!({"frames": files, "bytes": bytes, "dir": dir.display().to_string()})))
 }
 
 /// Largest GIF we produce (frames × pixels), keeping memory and time bounded.
@@ -824,9 +984,14 @@ fn export_html(s: &mut Session, p: &Value) -> Result<Value> {
         Some(t) if !t.trim().is_empty() => t.to_string(),
         _ => stem,
     };
-    let opts = anicraft_render::html::HtmlOptions { title, sound: opt_bool(p, "sound")?.unwrap_or(true), fit: opt_bool(p, "fit")?.unwrap_or(true) };
     let started = web_time::Instant::now();
-    let out = anicraft_render::html::to_html(&s.doc, &opts).map_err(EngineError::Param)?;
+    // Glyph outlines for fields that embed characters (ADR 0107), where the fonts allow it.
+    let embedded = crate::embed::embedded_faces(&s.doc);
+    let opts = anicraft_render::html::HtmlOptions { title, sound: opt_bool(p, "sound")?.unwrap_or(true), fit: opt_bool(p, "fit")?.unwrap_or(true), fonts: embedded.faces };
+    let mut out = anicraft_render::html::to_html(&s.doc, &opts).map_err(EngineError::Param)?;
+    for (note, n) in embedded.notes {
+        out.report.insert(note, n);
+    }
     crate::vfs::write(&path, out.html.as_bytes())?;
     let summary = if out.report.is_empty() {
         String::new()
@@ -849,6 +1014,7 @@ fn export_html(s: &mut Session, p: &Value) -> Result<Value> {
         "ms": started.elapsed().as_millis() as u64,
         "report": summary,
         "notes": out.report,
+        "fonts": embedded.summary,
     }))
 }
 
@@ -874,11 +1040,12 @@ fn export_gif(s: &mut Session, p: &Value) -> Result<Value> {
     let doc = &s.doc;
     let job = s.job.as_deref();
     let delays = gif_delays(n as usize, doc.stage.fps);
+    let cut = LeftOut::default();
     let frames: Vec<(craft_gif::write::PreparedFrame, u16)> = (from..to.saturating_add(1))
         .into_par_iter()
         .zip(delays.into_par_iter())
         .map(|(f, delay)| {
-            let (pm, _) = render(&anicraft_doc::evaluate(doc, f), &view)?;
+            let (pm, _) = render(&cut.evaluate(doc, f), &view)?;
             let rgba = pm.to_rgba8();
             let frame = craft_gif::write::prepare_frame(u32::from(w), u32::from(h), rgba, 10)
                 .map_err(|e| EngineError::Format(e.to_string()))?;
@@ -896,7 +1063,7 @@ fn export_gif(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     crate::vfs::write(&path, &bytes)?;
-    Ok(json!({"written": path.display().to_string(), "frames": n, "bytes": bytes.len(), "width": w, "height": h}))
+    Ok(cut.noted(json!({"written": path.display().to_string(), "frames": n, "bytes": bytes.len(), "width": w, "height": h})))
 }
 
 fn set_stage(s: &mut Session, p: &Value) -> Result<Value> {
@@ -908,4 +1075,67 @@ fn set_stage(s: &mut Session, p: &Value) -> Result<Value> {
         s.doc.stage.background = c;
     }
     Ok(json!({"width": s.doc.stage.width, "height": s.doc.stage.height, "fps": s.doc.stage.fps, "background": s.doc.stage.background.to_hex()}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #504: one SVG per movie frame, each the same as Export Frame as SVG gives.
+    #[test]
+    fn svg_sequence_writes_each_frame_as_the_single_frame_export_does() {
+        std::thread::spawn(|| {
+            crate::vfs::use_memory();
+            let mut s = Session::new(anicraft_doc::sample::demo());
+            let info = s.info();
+            let v = s.execute("file.export_svg_sequence", &json!({"dir": "seq", "from": 2, "to": 5})).unwrap();
+            assert_eq!(v["frames"], 4);
+            assert_eq!(v["dir"], "seq");
+            let dir = std::path::Path::new("seq");
+            let mut total = 0;
+            for f in 2..=5u32 {
+                let file = crate::vfs::read_to_string(&dir.join(format!("frame_{:05}.svg", f + 1))).unwrap();
+                assert!(file.starts_with("<svg") || file.starts_with("<?xml"), "{}", &file[..file.len().min(40)]);
+                assert_eq!(file, frame_svg(&s.doc, f), "frame {f}");
+                total += file.len() as u64;
+            }
+            assert_eq!(v["bytes"], total);
+            assert!(!crate::vfs::exists(&dir.join("frame_00002.svg")) && !crate::vfs::exists(&dir.join("frame_00007.svg")), "only the frames asked for");
+            assert_ne!(frame_svg(&s.doc, 2), frame_svg(&s.doc, 5), "the sample moves, so the frames differ");
+            assert_eq!(s.info(), info, "exporting changes nothing");
+            // Past the end is the last frame; a backwards range is refused; frames already there ask.
+            assert_eq!(s.execute("file.export_svg_sequence", &json!({"dir": "tail", "from": 4_000_000_000u32})).unwrap()["frames"], 1);
+            assert!(s.execute("file.export_svg_sequence", &json!({"dir": "seq", "from": 5, "to": 2})).is_err());
+            assert!(s.confirmation("file.export_svg_sequence", &json!({"dir": "seq"})).is_some_and(|c| c.irreversible));
+            assert!(s.confirmation("file.export_svg_sequence", &json!({"dir": "elsewhere"})).is_none());
+            assert!(s.confirmation("file.export_png_sequence", &json!({"dir": "seq"})).is_none(), "SVG frames are not PNG frames");
+            assert!(matches!(s.execute("file.export_svg_sequence", &json!({"dir": "seq"})), Err(EngineError::NeedsConfirmation(_))));
+            s.execute("file.export_svg_sequence", &json!({"dir": "seq", "confirm": true})).unwrap();
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn oversized_svg_frame_is_an_error_without_writing() {
+        // Keep this test's memory-backed files off reused test worker threads.
+        std::thread::spawn(|| {
+            crate::vfs::use_memory();
+            let mut s = Session::default();
+            let info = s.info();
+            let path = std::path::Path::new("frame.svg");
+            crate::vfs::put(path, b"keep this file".to_vec()).unwrap();
+            for (frame, shown) in [(u32::MAX, "4294967296"), (1, "2")] {
+                let error = s.execute("file.export_svg", &json!({"path": "frame.svg", "frame": frame, "confirm": true})).unwrap_err();
+                assert_eq!(error.to_string(), format!("frame {shown} is past the end (the timeline has 1 frames)"));
+                assert_eq!(crate::vfs::read(path).unwrap(), b"keep this file");
+                assert_eq!(s.info(), info);
+            }
+            s.execute("file.export_svg", &json!({"path": "frame.svg", "frame": 0, "confirm": true})).unwrap();
+            assert!(crate::vfs::read_to_string(path).unwrap().contains("<svg"));
+            assert_eq!(s.info(), info);
+        })
+        .join()
+        .unwrap();
+    }
 }

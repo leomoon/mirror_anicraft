@@ -182,8 +182,12 @@ and answers with its status, `{"id": 1, "ok": true, "result": {}, "revision": 7,
 Register the MCP server with Claude Code:
 
 ```sh
-claude mcp add anicraft -- /path/to/anicraft-cli mcp
+claude mcp add anicraft -- /path/to/anicraft-cli mcp \
+  --automation-read-root /path/to/project --automation-write-root /path/to/project
 ```
+
+The two folders are required: the assistant's commands read files only inside the first and
+write only inside the second.
 
 The details, including the server entry for other MCP clients, are in [`docs/mcp.md`](docs/mcp.md).
 
@@ -193,11 +197,10 @@ The details, including the server entry for other MCP clients, are in [`docs/mcp
 > **Early alpha: not yet for production animation work.** The core document model, vector renderer,
 > egui shell, classic and shape tweens, and the first XFL and SVG imports work; much is still to come.
 
-[**docs/roadmap.md**](docs/roadmap.md) has the honest status by dimension, milestones M0–M8 and what's next.
+[**docs/roadmap.md**](docs/roadmap.md) has the prioritised backlog, where every open pull request fits, and the honest status by dimension; [**docs/parity.md**](docs/parity.md) compares AniCraft with the reference app feature by feature.
 
-**What's missing:** audio layers, ActionScript beyond the timeline subset (frame scripts
-are kept, and those that control the timeline run; ADR 0013), motion tweens from XFL, a GPU renderer, and macOS and Linux CI runners
-(AniCraft is verified on Windows so far).
+**What's missing:** ActionScript beyond the timeline subset (frame scripts are kept, and those
+that control the timeline run; ADR 0013), and motion tweens from XFL.
 
 **Workspace:** strict downward-only layering, checked by `cargo test`:
 
@@ -232,7 +235,7 @@ with its licence in [`ATTRIBUTION.md`](ATTRIBUTION.md).
 
 **New to AniCraft?** Download it from the [AniCraft page on getartcraft.com](https://getartcraft.com/apps/anicraft). That's the easiest way to install it.
 
-**Want a specific build or format?** On GitHub, the [latest release](https://github.com/storytold/anicraft/releases/latest) has every build listed below, and [all releases](https://github.com/storytold/anicraft/releases) has earlier versions and their notes. `<ver>` in the file names is the version number, and `SHA256SUMS.txt` lists a checksum for every file.
+**Want a specific build or format?** On GitHub, the [latest release](https://github.com/storytold/anicraft/releases/latest) has the desktop packages listed below. Browse [all releases](https://github.com/storytold/anicraft/releases) for earlier versions and their notes. `<ver>` in the file names is the version number, and `SHA256SUMS.txt` lists a checksum for every file.
 
 ### Windows
 
@@ -240,7 +243,6 @@ with its licence in [`ATTRIBUTION.md`](ATTRIBUTION.md).
 |---|---|---|
 | x64 (64-bit Intel/AMD) | `anicraft-<ver>-windows-x64.msi` | `anicraft-<ver>-windows-x64-portable.zip` |
 | arm64 (Snapdragon and other ARM PCs) | `anicraft-<ver>-windows-arm64.msi` | `anicraft-<ver>-windows-arm64-portable.zip` |
-| x86 (32-bit) | `anicraft-<ver>-windows-x86.msi` | `anicraft-<ver>-windows-x86-portable.zip` |
 
 Installers and executables are code-signed.
 
@@ -259,15 +261,18 @@ Installers and executables are code-signed.
 | Flatpak | `anicraft-<ver>-linux-x86_64.flatpak` | `anicraft-<ver>-linux-aarch64.flatpak` | Sandboxed; `flatpak install --user <file>` |
 | Debian/Ubuntu | `anicraft-<ver>-linux-x86_64.deb` | `anicraft-<ver>-linux-aarch64.deb` | |
 | Fedora/RHEL/openSUSE | `anicraft-<ver>-linux-x86_64.rpm` | `anicraft-<ver>-linux-aarch64.rpm` | |
+| Arch Linux | `anicraft-<ver>-linux-x86_64.pkg.tar.zst` | `anicraft-<ver>-linux-aarch64.pkg.tar.zst` | |
 | Tarball | `anicraft-<ver>-linux-x86_64.tar.gz` | `anicraft-<ver>-linux-aarch64.tar.gz` | Unpack anywhere |
 
-RISC-V (riscv64): `anicraft-<ver>-linux-riscv64.tar.gz`, a tarball only.
+RISC-V (riscv64) packages are `anicraft-<ver>-linux-riscv64.deb`,
+`anicraft-<ver>-linux-riscv64.rpm`, and `anicraft-<ver>-linux-riscv64.tar.gz`.
 
 ### FreeBSD
 
 | Build | File |
 |---|---|
 | x86_64 | `anicraft-<ver>-freebsd-x86_64.tar.gz` |
+| aarch64 (ARM64) | `anicraft-<ver>-freebsd-aarch64.tar.gz` |
 
 ### Web (WebAssembly)
 

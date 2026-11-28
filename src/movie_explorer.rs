@@ -14,7 +14,7 @@ use anicraft_engine::StateId;
 use anicraft_engine::doc::{LayerKind, SymbolKind};
 use anicraft_engine::explorer::{self, NodeKind, Options, Row, Show, Tree};
 use anicraft_engine::find::Scope;
-use egui::{Key, Rect, Sense, Stroke, StrokeKind, WidgetType, pos2, vec2};
+use egui::{Key, Rect, Sense, Stroke, StrokeKind, Role, pos2, vec2};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -173,7 +173,7 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
     // The search, and the Show menu: kinds of rows, which scenes, the Library's symbols.
     ui.horizontal(|ui| {
         // The search takes what the Show button (as wide as its translation) leaves.
-        let menu_w_id = ui.id().with("explorer_show_w");
+        let menu_w_id = ui.scope_id().with("explorer_show_w");
         let menu_w = ui.data(|d| d.get_temp::<f32>(menu_w_id)).unwrap_or(72.0) + ui.spacing().item_spacing.x;
         let search = ui.add(egui::TextEdit::singleline(&mut app.explorer.filter).hint_text(tr!("Search")).desired_width((ui.available_width() - menu_w).max(crate::theme::MIN_FIELD)));
         search.set_name(tr!("Search the Movie Explorer"));
@@ -228,7 +228,7 @@ fn list(app: &mut App, ui: &mut egui::Ui, t: &Tree) {
     let mut toggle: Option<String> = None;
     let mut select: Option<String> = None;
     let mut go: Option<usize> = None;
-    let room = (ui.available_height() - 8.0).clamp(140.0, 320.0);
+    let room = (ui.available_height() - 8.0).max(0.0);
     let filtering = !app.explorer.filter.trim().is_empty();
     egui::ScrollArea::vertical().id_salt("explorer_rows").max_height(room).auto_shrink([false, true]).show_rows(ui, TARGET, t.rows.len(), |ui, range| {
         for i in range {
@@ -240,7 +240,7 @@ fn list(app: &mut App, ui: &mut egui::Ui, t: &Tree) {
                 p.rect_filled(rect, T.rc(), if on { T.accent_dim } else { T.hover });
             }
             if on {
-                p.rect_filled(Rect::from_min_size(rect.left_top(), vec2(3.0, rect.height())), 0.0, T.accent);
+                crate::theme::accent_bar(p, Rect::from_min_size(rect.left_top(), vec2(3.0, rect.height())));
             }
             let indent = 6.0 + r.depth.min(24) as f32 * 14.0;
             let chevron = Rect::from_center_size(pos2(rect.left() + indent + 6.0, rect.center().y), vec2(12.0, 12.0));
@@ -259,7 +259,7 @@ fn list(app: &mut App, ui: &mut egui::Ui, t: &Tree) {
                 (true, false) => tr!("{kind}: {row}, closed", kind = kind, row = label),
                 _ => tr!("{kind}: {row}", kind = kind, row = label),
             };
-            a11y::control(ui, &resp, WidgetType::SelectableLabel, &name, Some(on));
+            a11y::control(ui, &resp, Role::Button, &name, Some(on));
             let resp = resp.on_hover_text(tr!("{row}\nDouble-click to go there", row = name));
             if resp.clicked() {
                 let on_chevron = ui.input(|inp| inp.pointer.interact_pos()).is_some_and(|q| q.x < icon.left());

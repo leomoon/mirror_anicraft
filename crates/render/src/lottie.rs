@@ -49,7 +49,8 @@ pub struct LottieExport {
 
 /// The report line for artwork keyed frame by frame while it moves: exact at every frame,
 /// held between frames (ADR 0089).
-pub const STEPPED: &str = "motion keyed frame by frame (Elastic, Sine and similar eases, motion guides, tweens inside tweening symbols: no Lottie ease draws them)";
+pub const STEPPED: &str =
+    "motion keyed frame by frame (Elastic, Sine and similar eases, motion guides, tweens inside tweening symbols: no Lottie ease draws them)";
 
 /// How animated values are keyed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -99,7 +100,12 @@ impl Bez {
 
     /// The path through `m`.
     fn transformed(&self, m: &Affine) -> Bez {
-        Bez { closed: self.closed, v: self.v.iter().map(|p| m.apply(*p)).collect(), i: self.i.iter().map(|t| m.apply_vector(*t)).collect(), o: self.o.iter().map(|t| m.apply_vector(*t)).collect() }
+        Bez {
+            closed: self.closed,
+            v: self.v.iter().map(|p| m.apply(*p)).collect(),
+            i: self.i.iter().map(|t| m.apply_vector(*t)).collect(),
+            o: self.o.iter().map(|t| m.apply_vector(*t)).collect(),
+        }
     }
 
     /// Writes every cubic whose handles sit a third and two thirds along its chord as the
@@ -132,11 +138,13 @@ impl Bez {
 
     /// The path of [`Bez::flat`] values, as Lottie writes it.
     fn flat_value(closed: bool, f: &[f64]) -> Value {
-        let pts: Vec<Value> = f.chunks(2).map(|c| json!([num(c.first().copied().unwrap_or(0.0)), num(c.get(1).copied().unwrap_or(0.0))])).collect();
+        let pts: Vec<[f64; 2]> = f.chunks(2).map(|c| [c.first().copied().unwrap_or(0.0), c.get(1).copied().unwrap_or(0.0)]).collect();
         let k = pts.len() / 3;
         let (v, rest) = pts.split_at(k.min(pts.len()));
         let (i, o) = rest.split_at(k.min(rest.len()));
-        json!({"c": closed, "v": v, "i": i, "o": o})
+        // Geometry/easing stay application-owned; the shared path schema uses our
+        // existing compact numeric policy without a second rounding pass.
+        craft_lottie::Bezier { closed, vertices: v.to_vec(), in_tangents: i.to_vec(), out_tangents: o.to_vec() }.to_json_with(num)
     }
 }
 
@@ -267,7 +275,12 @@ fn look(s: &Sample) -> Look {
         Some(Fill::Gradient { stops, .. }) => stops.len(),
         _ => 0,
     };
-    (s.paths.iter().map(|b| (b.closed, b.v.len())).collect(), s.fill.as_ref().map_or(0, Fill::code), stops, s.stroke.as_ref().map(|l| (l.cap, l.join, l.dash.len())))
+    (
+        s.paths.iter().map(|b| (b.closed, b.v.len())).collect(),
+        s.fill.as_ref().map_or(0, Fill::code),
+        stops,
+        s.stroke.as_ref().map(|l| (l.cap, l.join, l.dash.len())),
+    )
 }
 
 /// A stroke in one frame, in the artwork's own space (a hairline's width is in stage pixels).
@@ -358,6 +371,16 @@ struct Track {
     first_index: usize,
 }
 
+/// Keep color sanitation and stop policy local; share only the flat Lottie wire order.
+fn gradient_values(stops: &[(f32, Rgba)]) -> Vec<f64> {
+    let colors = stops.iter().map(|(o, c)| {
+        let c = c.sanitized();
+        (f64::from(o.clamp(0.0, 1.0)), [f64::from(c.r), f64::from(c.g), f64::from(c.b)])
+    });
+    let opacities = stops.iter().map(|(o, c)| (f64::from(o.clamp(0.0, 1.0)), f64::from(c.sanitized().a)));
+    craft_lottie::flat_gradient_values(colors, opacities).collect()
+}
+
 fn rgb(c: Rgba) -> Vec<f64> {
     let c = c.sanitized();
     vec![f64::from(c.r), f64::from(c.g), f64::from(c.b), 1.0]
@@ -430,7 +453,14 @@ pub fn to_lottie(doc: &Document, name: &str, from: u32, to: u32, background: boo
 
 /// [`to_lottie`], keyed the way `keys` says.
 pub fn to_lottie_keyed(doc: &Document, name: &str, from: u32, to: u32, background: bool, keys: LottieKeys) -> LottieExport {
-    let names: HashMap<u64, String> = doc.scenes.iter().map(|s| &s.timeline).chain(doc.library.iter().map(|s| &s.timeline)).flat_map(|t| t.layers.iter()).map(|l| (l.id.0, l.name.clone())).collect();
+    let names: HashMap<u64, String> = doc
+        .scenes
+        .iter()
+        .map(|s| &s.timeline)
+        .chain(doc.library.iter().map(|s| &s.timeline))
+        .flat_map(|t| t.layers.iter())
+        .map(|l| (l.id.0, l.name.clone()))
+        .collect();
     let mut notes: HashMap<&'static str, HashSet<usize>> = HashMap::new();
     let mut tracks: Vec<Track> = Vec::new();
     // Open track per key: the index of the track it continues.
@@ -484,7 +514,8 @@ pub fn to_lottie_keyed(doc: &Document, name: &str, from: u32, to: u32, backgroun
                     }
                     if dl.clip_mode(c).is_soft() {
                         // A soft mask is a track matte: alpha, or luma.
-                        matte = soft_art.get(c as usize).map(|a| Matte { luma: dl.clip_mode(c) == anicraft_doc::MaskMode::Luminance, art: a.clone() });
+                        matte =
+                            soft_art.get(c as usize).map(|a| Matte { luma: dl.clip_mode(c) == anicraft_doc::MaskMode::Luminance, art: a.clone() });
                         Vec::new()
                     } else {
                         clip_art.get(c as usize).cloned().unwrap_or_default()
@@ -516,7 +547,11 @@ pub fn to_lottie_keyed(doc: &Document, name: &str, from: u32, to: u32, backgroun
             }
             let blend = lottie_blend(blend_mode);
             if !blend_mode.is_normal() {
-                flags.insert(if blend.is_some() { "blend modes (applied shape by shape)" } else { "Subtract, Invert, Alpha and Erase blending (Lottie has no equivalent; drawn normally)" });
+                flags.insert(if blend.is_some() {
+                    "blend modes (applied shape by shape)"
+                } else {
+                    "Subtract, Invert, Alpha and Erase blending (Lottie has no equivalent; drawn normally)"
+                });
             }
             let blend = blend.unwrap_or(0);
             let Some(mut s) = sample(item, opacity, masks, &mut flags) else {
@@ -564,7 +599,11 @@ pub fn to_lottie_keyed(doc: &Document, name: &str, from: u32, to: u32, backgroun
             if slot.is_some() {
                 continue;
             }
-            let found = open.iter().filter(|(k, ti)| k.same_look(key) && !taken.contains(ti) && tracks.get(**ti).is_some_and(|tr| tr.last + 1 == t)).map(|(_, ti)| *ti).min();
+            let found = open
+                .iter()
+                .filter(|(k, ti)| k.same_look(key) && !taken.contains(ti) && tracks.get(**ti).is_some_and(|tr| tr.last + 1 == t))
+                .map(|(_, ti)| *ti)
+                .min();
             if let Some(ti) = found {
                 taken.insert(ti);
                 *slot = Some(ti);
@@ -574,7 +613,14 @@ pub fn to_lottie_keyed(doc: &Document, name: &str, from: u32, to: u32, backgroun
             let ti = match slot {
                 Some(ti) => ti,
                 None => {
-                    tracks.push(Track { key: key.clone(), name: names.get(&layer_id).cloned().unwrap_or_default(), first: t, last: t, frames: Vec::new(), first_index: index });
+                    tracks.push(Track {
+                        key: key.clone(),
+                        name: names.get(&layer_id).cloned().unwrap_or_default(),
+                        first: t,
+                        last: t,
+                        frames: Vec::new(),
+                        first_index: index,
+                    });
                     tracks.len() - 1
                 }
             };
@@ -608,7 +654,8 @@ pub fn to_lottie_keyed(doc: &Document, name: &str, from: u32, to: u32, backgroun
         }
     }
     let rank = |i: usize| tracks.get(i).map_or((u32::MAX, usize::MAX), |t| (t.first, t.first_index));
-    let mut ready: std::collections::BTreeSet<((u32, usize), usize)> = (0..tracks.len()).filter(|&i| indegree.get(i) == Some(&0)).map(|i| (rank(i), i)).collect();
+    let mut ready: std::collections::BTreeSet<((u32, usize), usize)> =
+        (0..tracks.len()).filter(|&i| indegree.get(i) == Some(&0)).map(|i| (rank(i), i)).collect();
     let mut bottom_up: Vec<usize> = Vec::with_capacity(tracks.len());
     while let Some(first) = ready.pop_first() {
         let i = first.1;
@@ -658,8 +705,13 @@ pub fn to_lottie_keyed(doc: &Document, name: &str, from: u32, to: u32, backgroun
     let mattes = layers.len() - shape_layers;
     if background {
         let bg = doc.stage.background.sanitized();
-        layers.push(json!({"ddd": 0, "ind": shape_layers + mattes + 1, "ty": 1, "nm": "Stage", "sr": 1, "ks": static_ks(), "ao": 0, "ip": 0, "op": frames, "st": 0, "bm": 0,
-            "sc": bg.to_hex(), "sw": doc.stage.width, "sh": doc.stage.height}));
+        // A fully transparent stage has no background layer; otherwise alpha is the layer opacity.
+        if bg.a > 0.0 {
+            let mut ks = static_ks();
+            ks["o"]["k"] = n(bg.a.clamp(0.0, 1.0) * 100.0);
+            layers.push(json!({"ddd": 0, "ind": shape_layers + mattes + 1, "ty": 1, "nm": "Stage", "sr": 1, "ks": ks, "ao": 0, "ip": 0, "op": frames, "st": 0, "bm": 0,
+                "sc": bg.to_hex(), "sw": doc.stage.width, "sh": doc.stage.height}));
+        }
     }
     let root = json!({
         "v": "5.7.0",
@@ -759,20 +811,23 @@ impl Writer<'_> {
 
 fn write_keys(keys: &[Kf], enc: Enc) -> Value {
     match keys {
-        [] => json!({"a": 0, "k": 0}),
-        [k] => json!({"a": 0, "k": enc.value(&k.s)}),
-        _ => json!({"a": 1, "k": keys.iter().map(|k| {
-            let mut o = json!({"t": num(k.t), "s": enc.key(&k.s)});
-            match k.out {
-                Out::Hold => o["h"] = json!(1),
-                Out::Ease(out, inn) => {
-                    o["o"] = json!({"x": out.0, "y": out.1});
-                    o["i"] = json!({"x": inn.0, "y": inn.1});
-                }
-                Out::End => {}
-            }
-            o
-        }).collect::<Vec<_>>()}),
+        [] => craft_lottie::write_prop(json!(0), &[], None),
+        [k] => craft_lottie::write_prop(enc.value(&k.s), &[], None),
+        _ => {
+            let out: Vec<craft_lottie::KeyOut> = keys
+                .iter()
+                .map(|k| {
+                    let (hold, ease) = match k.out {
+                        Out::Hold => (true, Vec::new()),
+                        Out::Ease(out, inn) => (false, vec![craft_lottie::Tangents { ox: out.0, oy: out.1, ix: inn.0, iy: inn.1 }]),
+                        Out::End => (false, Vec::new()),
+                    };
+                    // Keep the timestamp precision used before the shared writer cutover.
+                    craft_lottie::KeyOut { t: crate::lottie_keys::r3(k.t), s: enc.key(&k.s), hold, ease, spatial: None }
+                })
+                .collect();
+            craft_lottie::write_prop(Value::Null, &out, None)
+        }
     }
 }
 
@@ -818,7 +873,10 @@ fn transforms(frames: &[(u32, Sample)]) -> Option<Vec<Tr>> {
     }
     // A frame squashed flat has no rotation or skew of its own: its neighbour's.
     let near = |i: usize| -> (f64, f64) {
-        (0..raw.len()).filter_map(|j| raw.get(j).copied().flatten().map(|v| (i.abs_diff(j), v))).min_by_key(|(d, _)| *d).map_or((0.0, 0.0), |(_, v)| v)
+        (0..raw.len())
+            .filter_map(|j| raw.get(j).copied().flatten().map(|v| (i.abs_diff(j), v)))
+            .min_by_key(|(d, _)| *d)
+            .map_or((0.0, 0.0), |(_, v)| v)
     };
     let mut out: Vec<Tr> = Vec::with_capacity(frames.len());
     let mut prev_r: Option<f64> = None;
@@ -927,10 +985,12 @@ fn layer(tr: &Track, ind: usize, w: &mut Writer<'_>) -> Value {
     match f.first().and_then(|(_, s)| s.fill.clone()) {
         Some(Fill::Solid { rule: r, .. }) => {
             let solid = |g: &dyn Fn(Rgba) -> Vec<f64>| -> Vec<Vec<f64>> {
-                f.iter().filter_map(|(_, s)| match &s.fill {
-                    Some(Fill::Solid { color, .. }) => Some(g(*color)),
-                    _ => None,
-                }).collect()
+                f.iter()
+                    .filter_map(|(_, s)| match &s.fill {
+                        Some(Fill::Solid { color, .. }) => Some(g(*color)),
+                        _ => None,
+                    })
+                    .collect()
             };
             let color = w.prop(first, &solid(&rgb), TOL_COLOR, Enc::Vector);
             let opacity = w.prop(first, &solid(&|c| vec![f64::from(c.sanitized().a) * 100.0]), TOL_OPACITY, Enc::Scalar);
@@ -960,19 +1020,14 @@ fn layer(tr: &Track, ind: usize, w: &mut Writer<'_>) -> Value {
                     };
                     start.push(vec![f64::from(a.x), f64::from(a.y)]);
                     end.push(vec![f64::from(b.x), f64::from(b.y)]);
-                    // Colour stops, then opacity stops: [offset, r, g, b, …, offset, a, …].
-                    let mut k: Vec<f64> = Vec::with_capacity(count * 6);
-                    for (o, c) in stops {
-                        let c = c.sanitized();
-                        k.extend([f64::from(o.clamp(0.0, 1.0)), f64::from(c.r), f64::from(c.g), f64::from(c.b)]);
-                    }
-                    for (o, c) in stops {
-                        k.extend([f64::from(o.clamp(0.0, 1.0)), f64::from(c.sanitized().a)]);
-                    }
-                    colors.push(k);
+                    colors.push(gradient_values(stops));
                 }
             }
-            let (s, e, g) = (w.prop(first, &start, TOL_PX, Enc::Vector), w.prop(first, &end, TOL_PX, Enc::Vector), w.prop(first, &colors, TOL_COLOR, Enc::Vector));
+            let (s, e, g) = (
+                w.prop(first, &start, TOL_PX, Enc::Vector),
+                w.prop(first, &end, TOL_PX, Enc::Vector),
+                w.prop(first, &colors, TOL_COLOR, Enc::Vector),
+            );
             items.push(json!({"ty": "gf", "nm": "Gradient Fill", "t": if radial { 2 } else { 1 }, "s": s, "e": e,
                 "g": {"p": count, "k": g}, "o": {"a": 0, "k": 100}, "r": rule(r), "h": {"a": 0, "k": 0}, "a": {"a": 0, "k": 0}}));
         }
@@ -1062,10 +1117,49 @@ mod tests {
             l.kind = kind;
             l.parent = parent;
             l.mask_mode = if kind == LayerKind::Mask { mode } else { Default::default() };
-            Arc::make_mut(&mut l.keyframes[0]).elements.push(Arc::new(Element { id: ElementId(100 + id), name: String::new(), transform: Affine::IDENTITY, color: ColorEffect::default(), kind: ElementKind::Shape(shape) }));
+            Arc::make_mut(&mut l.keyframes[0]).elements.push(Arc::new(Element {
+                id: ElementId(100 + id),
+                name: String::new(),
+                transform: Affine::IDENTITY,
+                color: ColorEffect::default(),
+                kind: ElementKind::Shape(shape),
+            }));
             d.timeline_mut(0).layers.push(Arc::new(l));
         }
         d
+    }
+
+    #[test]
+    fn shared_gradient_values_match_legacy_before_keyframe_fitting() {
+        fn legacy(stops: &[(f32, Rgba)]) -> Vec<f64> {
+            let mut k = Vec::with_capacity(stops.len() * 6);
+            for (o, c) in stops {
+                let c = c.sanitized();
+                k.extend([f64::from(o.clamp(0.0, 1.0)), f64::from(c.r), f64::from(c.g), f64::from(c.b)]);
+            }
+            for (o, c) in stops {
+                k.extend([f64::from(o.clamp(0.0, 1.0)), f64::from(c.sanitized().a)]);
+            }
+            k
+        }
+        let cases = [
+            vec![],
+            vec![(0.12345679, Rgba::WHITE), (1.0, Rgba::BLACK)],
+            vec![(0.5, Rgba::new(0.2, 0.4, 0.6, 0.25)), (0.5, Rgba::WHITE)],
+            vec![
+                (-1.0, Rgba { r: f32::NAN, g: f32::INFINITY, b: -1.0, a: 2.0 }),
+                (f32::NAN, Rgba::BLACK),
+                (f32::INFINITY, Rgba::WHITE),
+                (-0.0, Rgba::WHITE),
+            ],
+        ];
+        for stops in cases {
+            let actual = gradient_values(&stops);
+            let expected = legacy(&stops);
+            assert_eq!(actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+            assert_eq!(actual.iter().map(|x| num(*x)).collect::<Vec<_>>(), expected.iter().map(|x| num(*x)).collect::<Vec<_>>());
+            assert_eq!(actual.len(), stops.len() * 6, "opaque alpha stops must survive animated fitting");
+        }
     }
 
     #[test]
@@ -1092,9 +1186,53 @@ mod tests {
     }
 
     #[test]
+    fn transparent_stage_background_has_no_solid_layer() {
+        let mut d = sample::demo();
+        d.stage.background = anicraft_doc::Rgba::new(1.0, 0.0, 0.0, 0.0);
+        let v = parse(&to_lottie(&d, "x", 0, 1, true));
+        assert!(v["layers"].as_array().unwrap().iter().all(|l| l["ty"] != 1));
+    }
+
+    #[test]
+    fn semi_transparent_stage_background_sets_layer_opacity() {
+        let mut d = sample::demo();
+        d.stage.background = anicraft_doc::Rgba::new(1.0, 0.0, 0.0, 0.5);
+        let v = parse(&to_lottie(&d, "x", 0, 1, true));
+        let l = v["layers"].as_array().unwrap().iter().find(|l| l["ty"] == 1).unwrap();
+        assert_eq!(l["ks"]["o"]["k"].as_f64(), Some(50.0));
+        assert_eq!(l["sc"], "#ff0000");
+    }
+
+    #[test]
+    fn shared_path_wire_keeps_legacy_values_and_precision() {
+        for closed in [false, true] {
+            for flat in [
+                vec![],
+                vec![1.23456],
+                vec![0.0, -0.0, f64::NAN, f64::INFINITY, 1.23456, -2.34567],
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+                vec![1e303, -1e303, f64::MAX, -f64::MAX, 0.0, 0.0],
+            ] {
+                let pts: Vec<Value> =
+                    flat.chunks(2).map(|c| json!([num(c.first().copied().unwrap_or(0.0)), num(c.get(1).copied().unwrap_or(0.0))])).collect();
+                let k = pts.len() / 3;
+                let (v, rest) = pts.split_at(k);
+                let (i, o) = rest.split_at(k);
+                assert_eq!(Bez::flat_value(closed, &flat), json!({"c": closed, "v": v, "i": i, "o": o}));
+            }
+        }
+    }
+
+    #[test]
     fn beziers_bake_lines_quads_and_closing_points() {
         let mut p = Path::new();
-        p.cmds = vec![PathCmd::MoveTo(Vec2::new(0.0, 0.0)), PathCmd::LineTo(Vec2::new(10.0, 0.0)), PathCmd::QuadTo(Vec2::new(10.0, 10.0), Vec2::new(0.0, 10.0)), PathCmd::LineTo(Vec2::new(0.0, 0.0)), PathCmd::Close];
+        p.cmds = vec![
+            PathCmd::MoveTo(Vec2::new(0.0, 0.0)),
+            PathCmd::LineTo(Vec2::new(10.0, 0.0)),
+            PathCmd::QuadTo(Vec2::new(10.0, 10.0), Vec2::new(0.0, 10.0)),
+            PathCmd::LineTo(Vec2::new(0.0, 0.0)),
+            PathCmd::Close,
+        ];
         let b = beziers(&p, &Affine::translate(100.0, 0.0));
         assert_eq!(b.len(), 1);
         let b = &b[0];
@@ -1117,7 +1255,10 @@ mod tests {
         let frames = doc.frame_count();
         let e = to_lottie(&doc, "demo", 0, frames - 1, true);
         let v = parse(&e);
-        assert_eq!((v["w"].as_u64(), v["h"].as_u64(), v["op"].as_u64()), (Some(u64::from(doc.stage.width)), Some(u64::from(doc.stage.height)), Some(u64::from(frames))));
+        assert_eq!(
+            (v["w"].as_u64(), v["h"].as_u64(), v["op"].as_u64()),
+            (Some(u64::from(doc.stage.width)), Some(u64::from(doc.stage.height)), Some(u64::from(frames)))
+        );
         assert_eq!(v["fr"].as_f64(), Some(f64::from(doc.stage.fps)));
         let layers = v["layers"].as_array().unwrap();
         assert_eq!(layers.len(), e.layers + 1, "shape layers and the stage");
@@ -1141,14 +1282,48 @@ mod tests {
 
     /// A property's keyframes as written (`a: 0` is one key).
     fn keys_of(p: &Value) -> Vec<Kf> {
-        let vec = |v: &Value| -> Vec<f64> { if let Some(a) = v.as_array() { a.iter().map(|x| x.as_f64().unwrap()).collect() } else { vec![v.as_f64().unwrap()] } };
+        let vec = |v: &Value| -> Vec<f64> {
+            if let Some(a) = v.as_array() { a.iter().map(|x| x.as_f64().unwrap()).collect() } else { vec![v.as_f64().unwrap()] }
+        };
         if p["a"] == 0 {
             return vec![Kf { t: 0.0, s: vec(&p["k"]), out: Out::End }];
         }
-        p["k"].as_array().unwrap().iter().map(|k| {
-            let out = if k["h"] == 1 { Out::Hold } else if k.get("o").is_some() { Out::Ease((k["o"]["x"].as_f64().unwrap(), k["o"]["y"].as_f64().unwrap()), (k["i"]["x"].as_f64().unwrap(), k["i"]["y"].as_f64().unwrap())) } else { Out::End };
-            Kf { t: k["t"].as_f64().unwrap(), s: vec(&k["s"]), out }
-        }).collect()
+        p["k"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| {
+                let out = if k["h"] == 1 {
+                    Out::Hold
+                } else if k.get("o").is_some() {
+                    let first = |v: &Value| v.as_f64().or_else(|| v.as_array()?.first()?.as_f64()).unwrap();
+                    Out::Ease((first(&k["o"]["x"]), first(&k["o"]["y"])), (first(&k["i"]["x"]), first(&k["i"]["y"])))
+                } else {
+                    Out::End
+                };
+                Kf { t: k["t"].as_f64().unwrap(), s: vec(&k["s"]), out }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn shared_keys_keep_legacy_fractional_times_and_playback() {
+        let keys = vec![
+            Kf { t: 2.0, s: vec![0.0], out: Out::Ease((0.2, 0.1), (0.8, 0.9)) },
+            Kf { t: 3.2345, s: vec![10.0], out: Out::Hold },
+            Kf { t: 5.6789, s: vec![20.0], out: Out::End },
+        ];
+        let mut legacy = keys.clone();
+        for key in &mut legacy {
+            key.t = crate::lottie_keys::r3(key.t);
+        }
+        for enc in [Enc::Scalar, Enc::Vector] {
+            let written = keys_of(&write_keys(&keys, enc));
+            assert_eq!(written, legacy, "shared framing must retain the old time/value/ease policy");
+            for t in [2.0, 2.5, 3.2345, 3.235, 4.0, 5.6789, 5.679, 6.0] {
+                assert_eq!(crate::lottie_keys::value_at(&written, t), crate::lottie_keys::value_at(&legacy, t));
+            }
+        }
     }
 
     /// A square on layer 1 tweening from `a` to `b` over ten frames with `ease`.
@@ -1159,7 +1334,15 @@ mod tests {
         if stroke {
             shape.stroke = Some(Stroke::new(Rgba::WHITE, 2.0));
         }
-        let sq = |m: Affine| Arc::new(Element { id: ElementId(70), name: String::new(), transform: m, color: ColorEffect::default(), kind: ElementKind::Shape(shape.clone()) });
+        let sq = |m: Affine| {
+            Arc::new(Element {
+                id: ElementId(70),
+                name: String::new(),
+                transform: m,
+                color: ColorEffect::default(),
+                kind: ElementKind::Shape(shape.clone()),
+            })
+        };
         let mut doc = Document::default();
         let mut k0 = Keyframe::new(0, 10);
         k0.elements = vec![sq(a)];
@@ -1181,7 +1364,10 @@ mod tests {
         // eases, the second at the time the curve's middle point falls; the outline stays put.
         use anicraft_doc::{CustomEase, Easing};
         use std::sync::Arc;
-        let curve = CustomEase::from_flat(&[(0.0, 0.0), (0.2, 1.4), (0.3, 1.4), (0.4, 1.4), (0.6, 0.5), (0.8, 1.0), (1.0, 1.0)].map(|(x, y)| Vec2::new(x, y))).unwrap();
+        let curve = CustomEase::from_flat(
+            &[(0.0, 0.0), (0.2, 1.4), (0.3, 1.4), (0.4, 1.4), (0.6, 0.5), (0.8, 1.0), (1.0, 1.0)].map(|(x, y)| Vec2::new(x, y)),
+        )
+        .unwrap();
         let ease = Easing::Custom(Arc::new(curve));
         let doc = tweened(Affine::IDENTITY, Affine::translate(100.0, 0.0), ease.clone(), false);
         let e = to_lottie(&doc, "eased", 0, 14, false);
@@ -1196,6 +1382,32 @@ mod tests {
             let x = crate::lottie_keys::value_at(&p, f64::from(f)).unwrap()[0];
             let want = evaluate(&doc, f).items[0].transform.m[4];
             assert!((x - f64::from(want)).abs() < 2e-3, "frame {f}: {x} vs {want}");
+        }
+    }
+
+    #[test]
+    fn a_tween_that_keeps_area_is_baked_frame_by_frame() {
+        // ADR 0115: no cubic ease draws a geometric scale curve, so the check of ADR 0089
+        // refuses eased keys and the export holds every frame's own scale: the area a Lottie
+        // player shows is the one `evaluate` gives, on every frame.
+        use anicraft_doc::Easing;
+        use std::sync::Arc;
+        let mut doc = tweened(Affine::translate(50.0, 60.0), Affine::translate(50.0, 60.0).mul(&Affine::scale(2.0, 0.5)), Easing::Linear, false);
+        let l = Arc::make_mut(&mut doc.timeline_mut(0).layers[0]);
+        Arc::make_mut(&mut l.keyframes[0]).tween.as_mut().unwrap().keep_area = true;
+        let e = to_lottie(&doc, "squash", 0, 14, false);
+        let v = parse(&e);
+        let it = items(&v, 0);
+        let s = keys_of(&it.last().unwrap()["s"]);
+        assert!(s.len() >= 10, "a key a frame: {}", s.len());
+        for f in 0..=14 {
+            let got = crate::lottie_keys::value_at(&s, f64::from(f)).unwrap();
+            let want = evaluate(&doc, f).items[0].transform.decompose();
+            assert!(
+                (got[0] - f64::from(want.sx) * 100.0).abs() < 2e-2 && (got[1] - f64::from(want.sy) * 100.0).abs() < 2e-2,
+                "frame {f}: {got:?} vs {want:?}"
+            );
+            assert!((got[0] * got[1] - 10_000.0).abs() < 5.0, "frame {f}: the area stays ({got:?})");
         }
     }
 
@@ -1283,8 +1495,21 @@ mod tests {
     fn variable_width_strokes_export_as_filled_outlines() {
         use anicraft_doc::{Document, Element, ElementId, ElementKind, ProfilePreset, Shape, Stroke};
         let mut doc = Document::default();
-        let shape = Shape { path: std::sync::Arc::new(Path::line(Vec2::new(10.0, 10.0), Vec2::new(200.0, 10.0))), fill: None, stroke: Some(Stroke::new(Rgba::hex(0x00ff00), 10.0).with_profile(ProfilePreset::TaperEnd.profile())), fill_rule: FillRule::NonZero, merge: false, warp: None };
-        let el = Element { id: ElementId(77), name: String::new(), transform: Affine::IDENTITY, color: Default::default(), kind: ElementKind::Shape(shape) };
+        let shape = Shape {
+            path: std::sync::Arc::new(Path::line(Vec2::new(10.0, 10.0), Vec2::new(200.0, 10.0))),
+            fill: None,
+            stroke: Some(Stroke::new(Rgba::hex(0x00ff00), 10.0).with_profile(ProfilePreset::TaperEnd.profile())),
+            fill_rule: FillRule::NonZero,
+            merge: false,
+            warp: None,
+        };
+        let el = Element {
+            id: ElementId(77),
+            name: String::new(),
+            transform: Affine::IDENTITY,
+            color: Default::default(),
+            kind: ElementKind::Shape(shape),
+        };
         let layer = std::sync::Arc::make_mut(&mut doc.timeline_mut(0).layers[0]);
         layer.keyframe_mut(0).unwrap().elements.push(std::sync::Arc::new(el));
         let e = to_lottie(&doc, "w", 0, 0, false);
@@ -1300,8 +1525,21 @@ mod tests {
         use anicraft_doc::{Cap, Dash, Document, Element, ElementId, ElementKind, Join, Shape, Stroke, StrokeStyle};
         let export = |st: Stroke| {
             let mut doc = Document::default();
-            let shape = Shape { path: std::sync::Arc::new(Path::line(Vec2::new(10.0, 10.0), Vec2::new(200.0, 10.0))), fill: None, stroke: Some(st), fill_rule: FillRule::NonZero, merge: false, warp: None };
-            let el = Element { id: ElementId(77), name: String::new(), transform: Affine::scale(2.0, 2.0), color: Default::default(), kind: ElementKind::Shape(shape) };
+            let shape = Shape {
+                path: std::sync::Arc::new(Path::line(Vec2::new(10.0, 10.0), Vec2::new(200.0, 10.0))),
+                fill: None,
+                stroke: Some(st),
+                fill_rule: FillRule::NonZero,
+                merge: false,
+                warp: None,
+            };
+            let el = Element {
+                id: ElementId(77),
+                name: String::new(),
+                transform: Affine::scale(2.0, 2.0),
+                color: Default::default(),
+                kind: ElementKind::Shape(shape),
+            };
             let layer = std::sync::Arc::make_mut(&mut doc.timeline_mut(0).layers[0]);
             layer.keyframe_mut(0).unwrap().elements.push(std::sync::Arc::new(el));
             let v = parse(&to_lottie(&doc, "s", 0, 0, false));
@@ -1311,14 +1549,24 @@ mod tests {
         let st = export(Stroke::new(Rgba::BLACK, 3.0));
         assert_eq!((st["lc"].clone(), st["lj"].clone(), st["ml"].clone(), st.get("d").is_none()), (json!(2), json!(2), json!(4), true));
         // Butt caps, miter joins with their limit, dashes scaled like the width.
-        let style = StrokeStyle { cap: Cap::Butt, join: Join::Miter, miter_limit: 6.0, dash: Some(Dash::Dashed { lengths: vec![4.0, 1.5].into(), offset: 1.0 }) };
+        let style = StrokeStyle {
+            cap: Cap::Butt,
+            join: Join::Miter,
+            miter_limit: 6.0,
+            dash: Some(Dash::Dashed { lengths: vec![4.0, 1.5].into(), offset: 1.0 }),
+        };
         let st = export(Stroke::new(Rgba::BLACK, 3.0).with_style(style));
         assert_eq!((st["lc"].clone(), st["lj"].clone(), st["ml"].clone(), st["w"]["k"].clone()), (json!(1), json!(1), json!(6), json!(6)));
         let d = st["d"].as_array().unwrap();
         let got: Vec<(&str, f64)> = d.iter().map(|e| (e["n"].as_str().unwrap(), e["v"]["k"].as_f64().unwrap())).collect();
         assert_eq!(got, [("d", 8.0), ("g", 3.0), ("o", 2.0)]);
         // Dots: zero-length dashes with round caps, whatever the cap.
-        let st = export(Stroke::new(Rgba::BLACK, 3.0).with_style(StrokeStyle { cap: Cap::Square, join: Join::Bevel, dash: Dash::dotted(2.0), ..StrokeStyle::default() }));
+        let st = export(Stroke::new(Rgba::BLACK, 3.0).with_style(StrokeStyle {
+            cap: Cap::Square,
+            join: Join::Bevel,
+            dash: Dash::dotted(2.0),
+            ..StrokeStyle::default()
+        }));
         assert_eq!((st["lc"].clone(), st["lj"].clone()), (json!(2), json!(3)));
         assert_eq!((st["d"][0]["v"]["k"].as_f64(), st["d"][1]["v"]["k"].as_f64()), (Some(0.0), Some(10.0)));
     }

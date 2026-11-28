@@ -48,7 +48,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Fill",
             "",
             None,
-            "{type?: solid|linear|radial|bitmap (default: the swatch's), color? (solid), stops?: [{offset: 0..1, color: \"#rrggbb\" | \"#rrggbbaa\"}, ..] (2 to 15), spread?: extend|reflect|repeat, linear_rgb?: bool, focal?: -0.98..0.98 (radial), bitmap?: id, selection?: bool (default true)} sets the fill swatch (what new shapes, the Paint Bucket and the Brush pour) and, unless `selection` is false, the fills of the selected shapes. A shape keeping its kind of fill keeps where its gradient or bitmap lies; one changing kind gets it fitted to its bounds. A new gradient starts white to black → {fill: {type, ..}, changed}",
+            "{type?: solid|linear|radial|bitmap (default: the swatch's), color? (solid, \"#rrggbb\" or \"#rrggbbaa\"), stops?: [{offset: 0..1, color: \"#rrggbb\" | \"#rrggbbaa\"}, ..] (2 to 15; each stop has its own alpha), spread?: extend|reflect|repeat, linear_rgb?: bool, focal?: -0.98..0.98 (radial), bitmap?: id, selection?: bool (default true)} sets the fill swatch (what new shapes, the Paint Bucket and the Brush pour) and, unless `selection` is false, the fills of the selected shapes. A shape keeping its kind of fill keeps where its gradient or bitmap lies; one changing kind gets it fitted to its bounds. A new gradient starts white to black → {fill: {type, ..}, changed}",
             true,
             set_fill,
         ),
@@ -155,6 +155,23 @@ fn bucket(s: &mut Session, p: &Value) -> Result<Value> {
     // Under everything on the layer, so the lines that bound it stay on top.
     kf.elements.insert(0, Arc::new(el));
     Ok(json!({"element": id.0}))
+}
+
+/// Fills the empty area around `at` that the raw lines and fills of the active layer close off
+/// with `paint`, as the Paint Bucket does (behind the lines, joining fills of its colour).
+/// `false`: nothing closes it off.
+pub(crate) fn fill_enclosed(s: &mut Session, at: Vec2, paint: Paint) -> Result<bool> {
+    let Some(path) = crate::merge::enclosed_area(&s.visible_elements(), at) else { return Ok(false) };
+    let c = path.bounds().center();
+    let el = Element {
+        id: ElementId(s.doc.alloc_id()),
+        name: String::new(),
+        transform: Affine::translate(c.x, c.y),
+        color: ColorEffect::default(),
+        kind: ElementKind::Shape(Shape { fill: Some(paint), path: Arc::new(path.transformed(&Affine::translate(-c.x, -c.y))), stroke: None, fill_rule: FillRule::EvenOdd, merge: true, warp: None }),
+    };
+    crate::merge::merge_in_order(s, vec![el], crate::merge::Order::Behind)?;
+    Ok(true)
 }
 
 /// Grid over stage space: origin and cell size.
@@ -397,7 +414,7 @@ fn pick_style(s: &mut Session, p: &Value) -> Result<Value> {
             if other {
                 st.stroke = color;
                 st.use_stroke = true;
-                return Ok(json!({"picked": "fill", "into": "stroke", "paint": paint_kind(&paint), "color": color.to_hex()}));
+                return Ok(json!({"picked": "fill", "into": "stroke", "paint": paint_kind(&paint), "color": hex_alpha(color)}));
             }
             st.fill = color;
             st.fill_paint = (!matches!(paint, Paint::Solid(_))).then(|| paint.clone());
@@ -406,13 +423,13 @@ fn pick_style(s: &mut Session, p: &Value) -> Result<Value> {
                 st.lock_fill = true;
             }
             st.use_fill = true;
-            Ok(json!({"picked": "fill", "into": "fill", "paint": paint_kind(&paint), "color": color.to_hex()}))
+            Ok(json!({"picked": "fill", "into": "fill", "paint": paint_kind(&paint), "color": hex_alpha(color)}))
         }
         Some(Picked::Line(stroke, scale)) => {
             if other {
                 st.set_fill_color(stroke.color);
                 st.use_fill = true;
-                return Ok(json!({"picked": "line", "into": "fill", "paint": "solid", "color": stroke.color.to_hex()}));
+                return Ok(json!({"picked": "line", "into": "fill", "paint": "solid", "color": hex_alpha(stroke.color)}));
             }
             st.stroke = stroke.color;
             st.stroke_width = (stroke.width * scale).clamp(0.1, 1000.0);
@@ -430,7 +447,7 @@ fn pick_style(s: &mut Session, p: &Value) -> Result<Value> {
                     "custom"
                 }
             };
-            Ok(json!({"picked": "line", "into": "stroke", "color": stroke.color.to_hex(), "width": st.stroke_width, "profile": profile, "cap": st.line.cap.key(), "join": st.line.join.key(), "style": st.line.dash_kind().key()}))
+            Ok(json!({"picked": "line", "into": "stroke", "color": hex_alpha(stroke.color), "width": st.stroke_width, "profile": profile, "cap": st.line.cap.key(), "join": st.line.join.key(), "style": st.line.dash_kind().key()}))
         }
         None => Err(EngineError::State("click a fill or a line to pick its colour".into())),
     }
@@ -581,8 +598,7 @@ impl FillSpec {
 
 /// `#rrggbb`, or `#rrggbbaa` when not opaque.
 fn hex_alpha(c: Rgba) -> String {
-    let c = c.sanitized();
-    if c.a >= 1.0 { c.to_hex() } else { format!("{}{:02x}", c.to_hex(), (c.a * 255.0).round() as u8) }
+    c.to_hex_alpha()
 }
 
 /// A fill as `paint.set_fill` reports it (in its own params' terms).
